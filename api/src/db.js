@@ -62,7 +62,6 @@ function entityToJson(node) {
     x: scalar(p.x) ?? 0,
     y: scalar(p.y) ?? 0,
     notes: p.notes ?? '',
-    confidence: p.confidence ?? 'unconfirmed',
     created: scalar(p.created),
     updated: scalar(p.updated),
     props,

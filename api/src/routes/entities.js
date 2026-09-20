@@ -9,6 +9,9 @@ const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
 
 // Keys the API owns. User props are stripped of these so a stray key
 // cannot overwrite uid, type or the timestamps.
+//
+// 'confidence' stays listed although entities no longer carry it: leftover
+// values on older nodes should be ignored, not surfaced as user data.
 const RESERVED = [
   'uid', 'name', 'type', 'x', 'y', 'created', 'updated', 'confidence', 'notes',
 ];
@@ -19,7 +22,7 @@ router.post('/', async (req, res, next) => {
   try {
     const {
       name, type, props = {}, x = 0, y = 0,
-      notes = '', confidence = 'unconfirmed', source_uid = null,
+      notes = '', source_uid = null, source_confidence = 'unconfirmed',
     } = req.body;
 
     if (!name || !String(name).trim()) throw bad('name is required');
@@ -37,21 +40,23 @@ router.post('/', async (req, res, next) => {
     const r = await write(
       `CREATE (n:Entity:${type})
        SET n = $extra
-       SET n.uid        = $uid,
-           n.name       = $name,
-           n.type       = $type,
-           n.x          = $x,
-           n.y          = $y,
-           n.notes      = $notes,
-           n.confidence = $confidence,
-           n.created    = datetime(),
-           n.updated    = datetime()
+       SET n.uid     = $uid,
+           n.name    = $name,
+           n.type    = $type,
+           n.x       = $x,
+           n.y       = $y,
+           n.notes   = $notes,
+           n.created = datetime(),
+           n.updated = datetime()
        WITH n
        CALL {
          WITH n
          WITH n WHERE $source_uid IS NOT NULL
          MATCH (s:_Source {uid: $source_uid})
-         CREATE (n)-[:_FROM {confidence: $confidence, added: datetime()}]->(s)
+         CREATE (n)-[:_FROM {
+           confidence: $source_confidence,
+           added: datetime()
+         }]->(s)
        }
        RETURN n`,
       {
@@ -62,8 +67,8 @@ router.post('/', async (req, res, next) => {
         x: Math.round(Number(x) || 0),
         y: Math.round(Number(y) || 0),
         notes: String(notes),
-        confidence: String(confidence),
         source_uid,
+        source_confidence: String(source_confidence),
       },
     );
 
@@ -102,18 +107,36 @@ router.get('/:uid/sources', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/** Attach an existing source to this entity. */
+router.post('/:uid/sources', async (req, res, next) => {
+  try {
+    const { source_uid, confidence = 'unconfirmed' } = req.body;
+    if (!source_uid) throw bad('source_uid is required');
+
+    const r = await write(
+      `MATCH (n:Entity {uid: $uid}), (s:_Source {uid: $source_uid})
+       MERGE (n)-[f:_FROM]->(s)
+       ON CREATE SET f.added = datetime()
+       SET f.confidence = $confidence
+       RETURN s.uid AS uid`,
+      { uid: req.params.uid, source_uid, confidence: String(confidence) },
+    );
+    if (!r.records.length) throw bad('Entity or source not found', 404);
+    res.status(201).json({ source_uid: r.records[0].get('uid') });
+  } catch (e) { next(e); }
+});
+
 // ---------------------------------------------------------------- update
 
 router.patch('/:uid', async (req, res, next) => {
   try {
-    const { name, props, x, y, notes, confidence } = req.body;
+    const { name, props, x, y, notes } = req.body;
 
     const patch = {};
     if (name !== undefined) patch.name = String(name).trim();
     if (x !== undefined) patch.x = Math.round(Number(x) || 0);
     if (y !== undefined) patch.y = Math.round(Number(y) || 0);
     if (notes !== undefined) patch.notes = String(notes);
-    if (confidence !== undefined) patch.confidence = String(confidence);
 
     if (props && typeof props === 'object') {
       for (const [k, v] of Object.entries(props)) {
