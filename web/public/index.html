@@ -147,6 +147,9 @@ let etypes=new Map(), rtypes=new Map();
 let cam={x:0,y:0,k:1};
 let sel=null, linkFrom=null, pathFrom=null;
 let hidden=new Set();          // entity types toggled off
+let showLabels=true;
+let focusUid=null, focusDepth=0;   // N-degree-of-separation filter (0 = off)
+let collapsed=new Set();       // uids of nodes whose off-side subtree is folded
 
 const $=id=>document.getElementById(id);
 const svg=$('canvas'), sheet=$('sheet'), body=$('body'),
@@ -155,7 +158,7 @@ const svg=$('canvas'), sheet=$('sheet'), body=$('body'),
 
 const byUid=u=>nodes.find(n=>n.uid===u);
 const degree=u=>edges.filter(e=>e.from===u||e.to===u).length;
-const tstyle=t=>etypes.get(t)||{color:'#6b7280',glyph:'??'};
+const tstyle=t=>etypes.get(t)||{color:'#6b7280',glyph:'??',icon:''};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ---------------------------------------------------------------- api
@@ -178,7 +181,11 @@ function toast(m){
 
 function setStatus(){
   const vis=visible().n.length;
-  const extra=hidden.size?` · ${hidden.size} type${hidden.size>1?'s':''} hidden`:'';
+  const bits=[];
+  if(hidden.size) bits.push(`${hidden.size} type${hidden.size>1?'s':''} hidden`);
+  if(focusUid&&focusDepth>0) bits.push(`${focusDepth}° focus`);
+  if(collapsed.size) bits.push(`${collapsed.size} collapsed`);
+  const extra=bits.length?` · ${bits.join(' · ')}`:'';
   statusEl.textContent=`${vis}/${nodes.length} entities · ${edges.length} links${extra}`;
 }
 
@@ -216,10 +223,123 @@ const el=(tag,attrs)=>{
   return n;
 };
 
+// BFS hop-distance from `uid` over the full (untyped-filtered) graph.
+// Returns Map<uid, hops>. uid itself is hop 0.
+function bfsDepths(uid){
+  const adj=new Map();
+  for(const e of edges){
+    if(!adj.has(e.from)) adj.set(e.from,[]);
+    if(!adj.has(e.to)) adj.set(e.to,[]);
+    adj.get(e.from).push(e.to);
+    adj.get(e.to).push(e.from);
+  }
+  const dist=new Map([[uid,0]]);
+  const q=[uid];
+  while(q.length){
+    const cur=q.shift(), d=dist.get(cur);
+    for(const nb of adj.get(cur)||[]){
+      if(!dist.has(nb)){ dist.set(nb,d+1); q.push(nb); }
+    }
+  }
+  return dist;
+}
+
+// Connected components of the visible graph, optionally with one node
+// removed. Returns Map<uid, componentIndex>.
+function components(n,e,without){
+  const adj=new Map();
+  for(const x of n) if(x.uid!==without) adj.set(x.uid,[]);
+  for(const edge of e){
+    if(edge.from===without||edge.to===without) continue;
+    if(!adj.has(edge.from)||!adj.has(edge.to)) continue;
+    adj.get(edge.from).push(edge.to);
+    adj.get(edge.to).push(edge.from);
+  }
+  const comp=new Map();
+  let ci=0;
+  for(const uid of adj.keys()){
+    if(comp.has(uid)) continue;
+    const q=[uid]; comp.set(uid,ci);
+    while(q.length){
+      const cur=q.shift();
+      for(const nb of adj.get(cur)||[]) if(!comp.has(nb)){ comp.set(nb,ci); q.push(nb); }
+    }
+    ci++;
+  }
+  return comp;
+}
+
+// The visible node/edge set after type and N-degree filtering, but before
+// collapse is applied — the graph collapse eligibility and folding both
+// reason about.
+function preCollapseGraph(){
+  let n=nodes.filter(x=>!hidden.has(x.type));
+  let ids=new Set(n.map(x=>x.uid));
+  let e=edges.filter(x=>ids.has(x.from)&&ids.has(x.to));
+
+  if(focusUid&&focusDepth>0){
+    const dist=bfsDepths(focusUid);
+    n=n.filter(x=>(dist.get(x.uid)??Infinity)<=focusDepth);
+    ids=new Set(n.map(x=>x.uid));
+    e=e.filter(x=>ids.has(x.from)&&ids.has(x.to));
+  }
+  return {n,e};
+}
+
+// A node can only be collapsed if it's a true pendant point: removing it
+// splits the graph into exactly the "rest of the graph" plus one dangling
+// side. A branching hub (removal splits into 3+ pieces) is left alone —
+// there's no way to tell which branch to keep without a "came from"
+// direction, so collapse is restricted to unambiguous cases only.
+function pendantInfo(uid){
+  const {n,e}=preCollapseGraph();
+  const comp=components(n,e,uid);
+  const sizes=new Map();
+  for(const ci of comp.values()) sizes.set(ci,(sizes.get(ci)||0)+1);
+  if(sizes.size===0) return {ok:false,reason:'isolated'};
+  if(sizes.size===1) return {ok:false,reason:'leaf'};        // nothing past it
+  if(sizes.size>2) return {ok:false,reason:'hub'};            // ambiguous branch point
+  const [[,a],[,b]]=[...sizes.entries()];
+  return {ok:true,count:Math.min(a,b)};
+}
+
+// BloodHound-style fold: hides the dangling side of each collapsed pendant
+// point and replaces it with a single "+N" badge attached to that node.
+function collapseView(n,e){
+  if(!collapsed.size) return {n,e,badges:[]};
+
+  const hiddenUids=new Set();
+  const badges=[];
+
+  for(const foldUid of collapsed.keys()){
+    const root=byUid(foldUid);
+    if(!root || hiddenUids.has(foldUid)) continue;
+
+    const comp=components(n,e,foldUid);
+    const sizes=new Map();
+    for(const ci of comp.values()) sizes.set(ci,(sizes.get(ci)||0)+1);
+    if(sizes.size!==2) continue; // no longer a clean pendant (graph changed) — skip rather than guess
+    let mainCi=null, mainSize=-1;
+    for(const [ci,sz] of sizes) if(sz>mainSize){ mainSize=sz; mainCi=ci; }
+
+    let count=0;
+    for(const [uid,ci] of comp){
+      if(ci===mainCi) continue;
+      hiddenUids.add(uid); count++;
+    }
+    if(count>0) badges.push({parent:root,count});
+  }
+
+  const n2=n.filter(x=>!hiddenUids.has(x.uid));
+  const ids=new Set(n2.map(x=>x.uid));
+  const e2=e.filter(x=>ids.has(x.from)&&ids.has(x.to));
+  return {n:n2,e:e2,badges};
+}
+
 function visible(){
-  const n=nodes.filter(x=>!hidden.has(x.type));
-  const ids=new Set(n.map(x=>x.uid));
-  return {n, e:edges.filter(x=>ids.has(x.from)&&ids.has(x.to))};
+  const {n,e}=preCollapseGraph();
+  const {n:n3,e:e3,badges}=collapseView(n,e);
+  return {n:n3, e:e3, badges};
 }
 
 function render(){
@@ -235,38 +355,84 @@ function render(){
   svg.appendChild(defs);
 
   const g=el('g',{transform:`translate(${cam.x},${cam.y}) scale(${cam.k})`});
-  const {n:vn,e:ve}=visible();
+  const {n:vn,e:ve,badges}=visible();
   const idx=new Map(vn.map(n=>[n.uid,n]));
 
+  // Group edges by unordered node pair so multiple links between the same
+  // two entities (e.g. several transactions) fan out into separate arcs
+  // instead of drawing exactly on top of each other.
+  const pairKey=e=>e.from<e.to?`${e.from}|${e.to}`:`${e.to}|${e.from}`;
+  const pairs=new Map();
   for(const e of ve){
-    const a=idx.get(e.from), b=idx.get(e.to);
-    if(!a||!b) continue;
-    const on=sel&&sel.kind==='edge'&&sel.id===e.id;
-    const directed=(rtypes.get(e.type)||{}).directed!==false;
+    const k=pairKey(e);
+    if(!pairs.has(k)) pairs.set(k,[]);
+    pairs.get(k).push(e);
+  }
 
-    // stop the line at the node edge so the arrowhead is visible
-    const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)||1;
-    const ux=dx/len, uy=dy/len;
-    const x2=b.x-ux*(R+3), y2=b.y-uy*(R+3);
+  // confidence -> [opacity, extra stroke width, dash]
+  const CONF_STYLE={
+    confirmed:  [1,    0,   null],
+    probable:   [.6,   0,   null],
+    unconfirmed:[.6,   0,   '5,4'],
+  };
 
-    const line=el('line',{x1:a.x,y1:a.y,x2,y2,
-      stroke:on?'var(--select)':'var(--faint)','stroke-width':on?3:1.5});
-    if(directed) line.setAttribute('marker-end',on?'url(#arrowSel)':'url(#arrow)');
-    if(e.confidence==='unconfirmed') line.setAttribute('stroke-dasharray','5,4');
-    g.appendChild(line);
+  for(const [,group] of pairs){
+    const n=group.length;
+    group.forEach((e,i)=>{
+      const a=idx.get(e.from), b=idx.get(e.to);
+      if(!a||!b) return;
+      const on=sel&&sel.kind==='edge'&&sel.id===e.id;
+      const rt=rtypes.get(e.type)||{};
+      const directed=rt.directed!==false;
+      const baseColor=rt.color||'#475569';
+      const [opacity,,dash]=CONF_STYLE[e.confidence]||CONF_STYLE.unconfirmed;
 
-    const hitline=el('line',{x1:a.x,y1:a.y,x2:b.x,y2:b.y,
-      stroke:'transparent','stroke-width':18,style:'cursor:pointer'});
-    hitline.addEventListener('pointerdown',ev=>{
-      ev.stopPropagation(); sel={kind:'edge',id:e.id}; render(); openEdge(e);
+      const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)||1;
+      const ux=dx/len, uy=dy/len;
+      // perpendicular offset for this edge within its group, spread evenly
+      // around the straight line (0 offset when there's only one edge)
+      const spread=14;
+      const off=n>1?(i-(n-1)/2)*spread:0;
+      const px=-uy*off, py=ux*off;
+
+      const mx=(a.x+b.x)/2+px, my=(a.y+b.y)/2+py;
+
+      // Pull the endpoint back so the arrowhead clears the node. For a
+      // curved edge, "back" means back along the curve's own tangent near
+      // b (control point -> b), not the straight a->b direction, or the
+      // line would visibly clip into the node circle.
+      const tx=b.x-mx, ty=b.y-my, tlen=Math.hypot(tx,ty)||1;
+      const bux=off?tx/tlen:ux, buy=off?ty/tlen:uy;
+      const x2=b.x-bux*(R+3), y2=b.y-buy*(R+3);
+
+      const path=off
+        ? `M${a.x},${a.y} Q${mx},${my} ${x2},${y2}`
+        : `M${a.x},${a.y} L${x2},${y2}`;
+
+      const line=el('path',{d:path,fill:'none',
+        stroke:on?'var(--select)':baseColor,
+        'stroke-width':on?3:1.5,
+        opacity:on?1:opacity});
+      if(directed) line.setAttribute('marker-end',on?'url(#arrowSel)':'url(#arrow)');
+      if(dash) line.setAttribute('stroke-dasharray',dash);
+      g.appendChild(line);
+
+      const hitpath=off
+        ? `M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}`
+        : `M${a.x},${a.y} L${b.x},${b.y}`;
+      const hitline=el('path',{d:hitpath,fill:'none',
+        stroke:'transparent','stroke-width':18,style:'cursor:pointer'});
+      hitline.addEventListener('pointerdown',ev=>{
+        ev.stopPropagation(); sel={kind:'edge',id:e.id}; render(); openEdge(e);
+      });
+      g.appendChild(hitline);
+
+      const t=el('text',{x:mx,y:my-7,'text-anchor':'middle',
+        fill:on?'var(--select)':'#64748b','font-size':10,'font-weight':600,
+        style:'pointer-events:none;user-select:none'});
+      t.textContent=e.type;
+      g.appendChild(t);
     });
-    g.appendChild(hitline);
-
-    const t=el('text',{x:(a.x+b.x)/2,y:(a.y+b.y)/2-7,'text-anchor':'middle',
-      fill:on?'var(--select)':'#64748b','font-size':10,'font-weight':600,
-      style:'pointer-events:none;user-select:none'});
-    t.textContent=e.type;
-    g.appendChild(t);
   }
 
   for(const n of vn){
@@ -280,17 +446,49 @@ function render(){
 
     grp.appendChild(el('circle',{cx:n.x,cy:n.y,r:R,fill:st.color}));
 
-    const gl=el('text',{x:n.x,y:n.y+5,'text-anchor':'middle','font-size':14,
-      'font-weight':700,fill:'#0f172a',style:'pointer-events:none;user-select:none'});
-    gl.textContent=st.glyph;
+    const gl=el('text',{x:n.x,y:n.y+5,'text-anchor':'middle',
+      'font-size':st.icon?16:14,
+      'font-weight':700,fill:'#0f172a',
+      style:'pointer-events:none;user-select:none'});
+    gl.textContent=st.icon||st.glyph;
     grp.appendChild(gl);
 
-    const lb=el('text',{x:n.x,y:n.y+R+16,'text-anchor':'middle','font-size':12,
-      'font-weight':600,fill:'var(--text)',style:'pointer-events:none;user-select:none'});
-    lb.textContent=n.name.length>22?n.name.slice(0,21)+'…':n.name;
-    grp.appendChild(lb);
+    if(showLabels){
+      const lb=el('text',{x:n.x,y:n.y+R+16,'text-anchor':'middle','font-size':12,
+        'font-weight':600,fill:'var(--text)',style:'pointer-events:none;user-select:none'});
+      lb.textContent=n.name.length>22?n.name.slice(0,21)+'…':n.name;
+      grp.appendChild(lb);
+    }
+
+    if(collapsed.has(n.uid)){
+      grp.appendChild(el('circle',{cx:n.x+R-6,cy:n.y-R+6,r:7,fill:'var(--select)'}));
+      const fm=el('text',{x:n.x+R-6,y:n.y-R+9,'text-anchor':'middle','font-size':10,
+        'font-weight':700,fill:'#0f172a',style:'pointer-events:none;user-select:none'});
+      fm.textContent='−';
+      grp.appendChild(fm);
+    }
 
     g.appendChild(grp);
+  }
+
+  // collapsed-subtree badges: a small ring node offset from its parent
+  for(const b of badges){
+    const bx=b.parent.x+R+34, by=b.parent.y+R+34;
+    const bg=el('g',{style:'cursor:pointer'});
+    bg.appendChild(el('line',{x1:b.parent.x,y1:b.parent.y,x2:bx,y2:by,
+      stroke:'var(--faint)','stroke-width':1.5,'stroke-dasharray':'3,4'}));
+    bg.appendChild(el('circle',{cx:bx,cy:by,r:18,fill:'var(--surface2)',
+      stroke:'var(--select)','stroke-width':2}));
+    const bt=el('text',{x:bx,y:by+4,'text-anchor':'middle','font-size':12,
+      'font-weight':700,fill:'var(--select)',style:'pointer-events:none;user-select:none'});
+    bt.textContent='+'+b.count;
+    bg.appendChild(bt);
+    bg.addEventListener('pointerdown',ev=>{
+      ev.stopPropagation();
+      collapsed.delete(b.parent.uid);
+      render(); setStatus();
+    });
+    g.appendChild(bg);
   }
 
   svg.appendChild(g);
@@ -609,6 +807,15 @@ function openInspect(n){
     <div class="row">
       <button class="btn ghost small" id="a-path">Find path from here</button>
       <button class="btn ghost small" id="a-hide">Hide</button>
+    </div>
+    <div class="row">
+      <button class="btn ghost small" id="a-fold">${collapsed.has(n.uid)?'Uncollapse'
+        :(pendantInfo(n.uid).ok?`Collapse (${pendantInfo(n.uid).count})`:'Collapse')}</button>
+    </div>
+    <label>Degrees of separation ${focusUid===n.uid&&focusDepth>0?`<button class="linkbtn" id="a-unfocus" style="margin:0 0 0 8px">clear</button>`:''}</label>
+    <div class="chips" id="c-deg" data-kind="conf">
+      ${[1,2,3,4].map(d=>`<button class="chip ${focusUid===n.uid&&focusDepth===d?'on':''}" data-v="${d}"
+        style="border-color:var(--faint)${focusUid===n.uid&&focusDepth===d?';background:var(--faint);color:#e2e8f0':''}">${d}</button>`).join('')}
     </div>`);
 
   body.querySelector('#a-exp').onclick=async()=>{
@@ -649,6 +856,30 @@ function openInspect(n){
   };
 
   body.querySelector('#a-edit').onclick=()=>openEdit(n);
+
+  body.querySelector('#a-fold').onclick=()=>{
+    if(collapsed.has(n.uid)){
+      collapsed.delete(n.uid); closeSheet(); render(); setStatus(); return;
+    }
+    const info=pendantInfo(n.uid);
+    if(!info.ok){
+      const why={leaf:'nothing past this node to collapse',
+        isolated:'this node has no visible connections',
+        hub:'this node branches — collapse only works on a single dangling chain'}[info.reason];
+      toast(`Can't collapse: ${why}`);
+      return;
+    }
+    collapsed.add(n.uid); closeSheet(); render(); setStatus();
+  };
+
+  wireChips('#c-deg',v=>{
+    focusUid=n.uid; focusDepth=parseInt(v,10);
+    closeSheet(); render(); setStatus();
+  });
+  const unfocusBtn=body.querySelector('#a-unfocus');
+  if(unfocusBtn) unfocusBtn.onclick=()=>{
+    focusUid=null; focusDepth=0; closeSheet(); render(); setStatus();
+  };
 }
 
 // ---- create ----
@@ -736,6 +967,8 @@ function openEdit(n){
       await req(`/entities/${n.uid}`,{method:'DELETE'});
       nodes=nodes.filter(x=>x.uid!==n.uid);
       edges=edges.filter(e=>e.from!==n.uid&&e.to!==n.uid);
+      collapsed.delete(n.uid);
+      if(focusUid===n.uid){ focusUid=null; focusDepth=0; }
       sel=null; closeSheet(); render(); setStatus();
     }catch(e){ toast('Delete failed: '+e.message); }
   };
@@ -835,9 +1068,11 @@ function openNewType(after){
     <label>Name (letters, digits, underscore)</label>
     <input type="text" id="t-name" placeholder="e.g. Vessel">
     <div class="split">
-      <div><label>Glyph (2 chars)</label><input type="text" id="t-glyph" maxlength="2" placeholder="VS"></div>
-      <div><label>Colour</label><input type="text" id="t-color" value="#0ea5e9"></div>
+      <div><label>Glyph (2 chars, fallback)</label><input type="text" id="t-glyph" maxlength="2" placeholder="VS"></div>
+      <div><label>Colour</label><input type="color" id="t-color" value="#0ea5e9"></div>
     </div>
+    <label>Icon (emoji/unicode, optional — overrides glyph)</label>
+    <input type="text" id="t-icon" maxlength="8" placeholder="⚓">
     <div class="row">
       <button class="btn" id="a-save">Add</button>
       <button class="btn ghost" id="a-cancel">Cancel</button>
@@ -849,11 +1084,51 @@ function openNewType(after){
     try{
       const t=await req('/types/entity',{method:'POST',body:JSON.stringify({
         name,glyph:body.querySelector('#t-glyph').value.trim()||name.slice(0,2),
-        color:body.querySelector('#t-color').value.trim()||'#6b7280',
+        color:body.querySelector('#t-color').value,
+        icon:body.querySelector('#t-icon').value.trim(),
       })});
       etypes.set(t.name,t);
       after?after():closeSheet();
     }catch(e){ toast('Failed: '+e.message); }
+  };
+}
+
+function openEditType(t,after){
+  openSheet(`
+    <h2>Edit entity type</h2>
+    <div class="sub">${esc(t.name)}${t.builtin?' · built-in':''}</div>
+    <div class="split">
+      <div><label>Glyph (2 chars, fallback)</label><input type="text" id="t-glyph" maxlength="2" value="${esc(t.glyph)}"></div>
+      <div><label>Colour</label><input type="color" id="t-color" value="${esc(t.color)}"></div>
+    </div>
+    <label>Icon (emoji/unicode, optional — overrides glyph)</label>
+    <input type="text" id="t-icon" maxlength="8" value="${esc(t.icon||'')}" placeholder="⚓">
+    <div class="row">
+      <button class="btn" id="a-save">Save</button>
+      ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
+    </div>
+    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`);
+
+  body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
+  body.querySelector('#a-save').onclick=async()=>{
+    try{
+      const u=await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
+        glyph:body.querySelector('#t-glyph').value.trim()||t.glyph,
+        color:body.querySelector('#t-color').value,
+        icon:body.querySelector('#t-icon').value.trim(),
+      })});
+      etypes.set(u.name,u);
+      render();
+      after?after():closeSheet();
+    }catch(e){ toast('Save failed: '+e.message); }
+  };
+  const delBtn=body.querySelector('#a-del');
+  if(delBtn) delBtn.onclick=async()=>{
+    try{
+      await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'DELETE'});
+      etypes.delete(t.name);
+      after?after():closeSheet();
+    }catch(e){ toast('Delete failed: '+e.message); }
   };
 }
 
@@ -862,10 +1137,15 @@ function openNewRel(after){
     <h2>New relationship type</h2>
     <label>Name (will be upper-cased)</label>
     <input type="text" id="t-name" placeholder="e.g. chartered_by">
-    <label>Direction</label>
-    <div class="chips" id="c-dir" data-kind="conf">
-      <button class="chip on" data-v="1" style="border-color:var(--faint);background:var(--faint)">directed</button>
-      <button class="chip" data-v="0" style="border-color:var(--faint)">undirected</button>
+    <div class="split">
+      <div>
+        <label>Direction</label>
+        <div class="chips" id="c-dir" data-kind="conf">
+          <button class="chip on" data-v="1" style="border-color:var(--faint);background:var(--faint)">directed</button>
+          <button class="chip" data-v="0" style="border-color:var(--faint)">undirected</button>
+        </div>
+      </div>
+      <div><label>Colour</label><input type="color" id="t-color" value="#475569"></div>
     </div>
     <div class="row">
       <button class="btn" id="a-save">Add</button>
@@ -878,11 +1158,92 @@ function openNewRel(after){
     const name=body.querySelector('#t-name').value.trim();
     if(!name){ toast('Name required'); return; }
     try{
-      const t=await req('/types/rel',{method:'POST',body:JSON.stringify({name,directed})});
+      const t=await req('/types/rel',{method:'POST',body:JSON.stringify({
+        name,directed,color:body.querySelector('#t-color').value,
+      })});
       rtypes.set(t.name,t);
       after?after():closeSheet();
     }catch(e){ toast('Failed: '+e.message); }
   };
+}
+
+function openEditRel(t,after){
+  openSheet(`
+    <h2>Edit relationship type</h2>
+    <div class="sub">${esc(t.name)}${t.builtin?' · built-in':''}</div>
+    <div class="split">
+      <div>
+        <label>Direction</label>
+        <div class="chips" id="c-dir" data-kind="conf">
+          <button class="chip ${t.directed?'on':''}" data-v="1"
+            style="border-color:var(--faint)${t.directed?';background:var(--faint)':''}">directed</button>
+          <button class="chip ${t.directed?'':'on'}" data-v="0"
+            style="border-color:var(--faint)${t.directed?'':';background:var(--faint)'}">undirected</button>
+        </div>
+      </div>
+      <div><label>Colour</label><input type="color" id="t-color" value="${esc(t.color)}"></div>
+    </div>
+    <div class="row">
+      <button class="btn" id="a-save">Save</button>
+      ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
+    </div>
+    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`);
+
+  let directed=t.directed;
+  wireChips('#c-dir',v=>directed=v==='1');
+  body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
+  body.querySelector('#a-save').onclick=async()=>{
+    try{
+      const u=await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
+        directed, color:body.querySelector('#t-color').value,
+      })});
+      rtypes.set(u.name,u);
+      render();
+      after?after():closeSheet();
+    }catch(e){ toast('Save failed: '+e.message); }
+  };
+  const delBtn=body.querySelector('#a-del');
+  if(delBtn) delBtn.onclick=async()=>{
+    try{
+      await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'DELETE'});
+      rtypes.delete(t.name);
+      after?after():closeSheet();
+    }catch(e){ toast('Delete failed: '+e.message); }
+  };
+}
+
+// ---- manage types (list, edit, delete) ----
+function openManageTypes(){
+  const erows=[...etypes.values()].map(t=>
+    `<div class="prop" style="cursor:pointer;display:flex;align-items:center;gap:8px" data-etype="${esc(t.name)}">
+      <span class="dot" style="width:14px;height:14px;background:${t.color}"></span>
+      <span style="flex:1">${t.icon?esc(t.icon)+' ':''}${esc(t.name)}${t.builtin?' <span class="rtype">built-in</span>':''}</span>
+    </div>`).join('');
+  const rrows=[...rtypes.values()].map(t=>
+    `<div class="prop" style="cursor:pointer;display:flex;align-items:center;gap:8px" data-rtype="${esc(t.name)}">
+      <span class="dot" style="width:14px;height:14px;background:${t.color}"></span>
+      <span style="flex:1">${esc(t.name)} <span class="rtype">${t.directed?'directed':'undirected'}</span>${t.builtin?' <span class="rtype">built-in</span>':''}</span>
+    </div>`).join('');
+
+  openSheet(`
+    <h2>Manage types</h2>
+    <label>Entity types</label>
+    ${erows||'<div class="mini">None yet</div>'}
+    <label>Relationship types</label>
+    ${rrows||'<div class="mini">None yet</div>'}
+    <div class="row">
+      <button class="btn ghost small" id="a-newtype">+ Entity type</button>
+      <button class="btn ghost small" id="a-newrel">+ Link type</button>
+    </div>
+    <div class="row"><button class="btn ghost small" id="a-back">Back</button></div>`);
+
+  body.querySelectorAll('[data-etype]').forEach(d=>
+    d.onclick=()=>openEditType(etypes.get(d.dataset.etype),openManageTypes));
+  body.querySelectorAll('[data-rtype]').forEach(d=>
+    d.onclick=()=>openEditRel(rtypes.get(d.dataset.rtype),openManageTypes));
+  body.querySelector('#a-newtype').onclick=()=>openNewType(openManageTypes);
+  body.querySelector('#a-newrel').onclick=()=>openNewRel(openManageTypes);
+  body.querySelector('#a-back').onclick=openMenu;
 }
 
 // ---- path ----
@@ -929,6 +1290,14 @@ async function openMenu(){
     <label>Show types</label>
     <div class="chips" id="c-vis">${typeToggles}</div>
 
+    <label>Display</label>
+    <div class="chips">
+      <button class="chip ${showLabels?'on':''}" id="a-labels"
+        style="border-color:var(--faint)${showLabels?';background:var(--faint);color:#e2e8f0':''}">Labels</button>
+      ${focusUid?`<button class="chip on" id="a-clearfocus" style="border-color:var(--select);background:var(--select);color:#0f172a">Focus: ${focusDepth}° — clear</button>`:''}
+      ${collapsed.size?`<button class="chip on" id="a-clearfold" style="border-color:var(--select);background:var(--select);color:#0f172a">${collapsed.size} collapsed — expand all</button>`:''}
+    </div>
+
     <label>Most connected</label>
     ${hubs||'<div class="mini">Nothing yet</div>'}
 
@@ -937,8 +1306,7 @@ async function openMenu(){
       <button class="btn ghost small" id="a-sources">Sources</button>
     </div>
     <div class="row">
-      <button class="btn ghost small" id="a-newtype">+ Entity type</button>
-      <button class="btn ghost small" id="a-newrel">+ Link type</button>
+      <button class="btn ghost small" id="a-types">Manage types</button>
     </div>`);
 
   body.querySelectorAll('#c-vis .chip').forEach(c=>c.onclick=()=>{
@@ -951,10 +1319,21 @@ async function openMenu(){
   body.querySelectorAll('.prop[data-uid]').forEach(d=>
     d.onclick=()=>{ closeSheet(); focusNode(d.dataset.uid); });
 
+  body.querySelector('#a-labels').onclick=()=>{
+    showLabels=!showLabels; render(); openMenu();
+  };
+  const clearFocusBtn=body.querySelector('#a-clearfocus');
+  if(clearFocusBtn) clearFocusBtn.onclick=()=>{
+    focusUid=null; focusDepth=0; render(); setStatus(); openMenu();
+  };
+  const clearFoldBtn=body.querySelector('#a-clearfold');
+  if(clearFoldBtn) clearFoldBtn.onclick=()=>{
+    collapsed.clear(); render(); setStatus(); openMenu();
+  };
+
   body.querySelector('#a-reload').onclick=async()=>{ closeSheet(); await loadGraph(); };
   body.querySelector('#a-sources').onclick=openSources;
-  body.querySelector('#a-newtype').onclick=()=>openNewType(openMenu);
-  body.querySelector('#a-newrel').onclick=()=>openNewRel(openMenu);
+  body.querySelector('#a-types').onclick=openManageTypes;
 }
 
 async function openSources(){
