@@ -1,4 +1,4 @@
-name: intelligraph
+name: ${COMPOSE_PROJECT_NAME:-intelligraph}
 
 services:
   neo4j:
