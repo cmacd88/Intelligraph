@@ -17,6 +17,18 @@ router.post('/rel', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.patch('/entity/:name', async (req, res, next) => {
+  try {
+    res.json(await types.updateEntityType(req.params.name, req.body));
+  } catch (e) { next(e); }
+});
+
+router.patch('/rel/:name', async (req, res, next) => {
+  try {
+    res.json(await types.updateRelType(req.params.name, req.body));
+  } catch (e) { next(e); }
+});
+
 router.delete('/entity/:name', async (req, res, next) => {
   try {
     await types.deleteEntityType(req.params.name);

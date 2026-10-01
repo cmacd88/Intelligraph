@@ -975,14 +975,43 @@ function openEdit(n){
 }
 
 // ---- link ----
-function openLink(from,to){
+// ---- soft type-hierarchy / valid-pair helpers ----
+// Mirrors api/src/types.js: a type always matches itself; otherwise walk
+// its `parent` chain looking for `ancestorName`. Client-side because pair
+// filtering is UI guidance only (see ROADMAP — hard validation deferred).
+function isDescendantOf(typeName,ancestorName){
+  if(typeName===ancestorName) return true;
+  let cur=etypes.get(typeName), hops=0;
+  while(cur&&cur.parent&&hops<etypes.size){
+    if(cur.parent===ancestorName) return true;
+    cur=etypes.get(cur.parent); hops++;
+  }
+  return false;
+}
+function isValidPair(relName,fromType,toType){
+  const rel=rtypes.get(relName);
+  if(!rel||!rel.validPairs||!rel.validPairs.length) return true;
+  const oneWay=(from,to)=>rel.validPairs.some(entry=>
+    entry&&entry.from&&isDescendantOf(from,entry.from)&&
+    Array.isArray(entry.to)&&entry.to.some(t=>isDescendantOf(to,t)));
+  if(oneWay(fromType,toType)) return true;
+  if(!rel.directed&&oneWay(toType,fromType)) return true;
+  return false;
+}
+
+function openLink(from,to,showAll){
   if(!from||!to) return;
-  let rel=[...rtypes.keys()][0], conf='unconfirmed';
+  const relOpts=showAll?[...rtypes.values()]:
+    [...rtypes.values()].filter(t=>isValidPair(t.name,from.type,to.type));
+  const relList=relOpts.length?relOpts:[...rtypes.values()];
+  let rel=relList[0]?.name, conf='unconfirmed';
+  const filtered=!showAll&&relOpts.length<rtypes.size;
   openSheet(`
     <h2>New relationship</h2>
     <div class="sub">${esc(from.name)} → ${esc(to.name)}</div>
     <label>Type <button class="linkbtn" id="a-newrel" style="margin:0 0 0 8px">+ new type</button></label>
-    ${dropdownHTML('c-rel',[...rtypes.values()].map(t=>({value:t.name,label:t.name})),rel)}
+    ${dropdownHTML('c-rel',relList.map(t=>({value:t.name,label:t.name})),rel)}
+    ${filtered?`<div class="mini">Filtered to types valid for ${esc(from.type)} → ${esc(to.type)}. <span class="linkbtn" id="a-showall" style="cursor:pointer">Show all</span></div>`:''}
     <label>Confidence</label>
     <div class="chips" id="c-conf" data-kind="conf">${confChips(conf)}</div>
     <label>Properties</label>
@@ -997,7 +1026,9 @@ function openLink(from,to){
   wireDropdown('c-rel',v=>rel=v);
   wireChips('#c-conf',v=>conf=v);
   body.querySelector('#a-cancel').onclick=closeSheet;
-  body.querySelector('#a-newrel').onclick=()=>openNewRel(()=>openLink(from,to));
+  body.querySelector('#a-newrel').onclick=()=>openNewRel(()=>openLink(from,to,showAll));
+  const showAllBtn=body.querySelector('#a-showall');
+  if(showAllBtn) showAllBtn.onclick=()=>openLink(from,to,true);
 
   body.querySelector('#a-save').onclick=async()=>{
     try{
@@ -1062,6 +1093,20 @@ function openEdge(e){
 }
 
 // ---- new types ----
+// opts for the "is a" parent picker: every entity type except `exclude`
+// itself (a type can't be its own parent) and, when editing, any type that
+// already descends from `exclude` (would create a cycle — see wouldCycle
+// server-side; this is just the client-side equivalent for the dropdown).
+function parentOptions(exclude){
+  const opts=[{value:'',label:'— none (root type) —'}];
+  for(const t of etypes.values()){
+    if(t.name===exclude) continue;
+    if(exclude&&isDescendantOf(t.name,exclude)) continue;
+    opts.push({value:t.name,label:t.name,color:t.color});
+  }
+  return opts;
+}
+
 function openNewType(after){
   openSheet(`
     <h2>New entity type</h2>
@@ -1073,10 +1118,14 @@ function openNewType(after){
     </div>
     <label>Icon (emoji/unicode, optional — overrides glyph)</label>
     <input type="text" id="t-icon" maxlength="8" placeholder="⚓">
+    <label>Is a (optional — inherits valid-target rules from this type)</label>
+    ${dropdownHTML('c-parent',parentOptions(),'')}
     <div class="row">
       <button class="btn" id="a-save">Add</button>
       <button class="btn ghost" id="a-cancel">Cancel</button>
     </div>`);
+  let parent='';
+  wireDropdown('c-parent',v=>parent=v);
   body.querySelector('#a-cancel').onclick=()=>after?after():closeSheet();
   body.querySelector('#a-save').onclick=async()=>{
     const name=body.querySelector('#t-name').value.trim();
@@ -1086,6 +1135,7 @@ function openNewType(after){
         name,glyph:body.querySelector('#t-glyph').value.trim()||name.slice(0,2),
         color:body.querySelector('#t-color').value,
         icon:body.querySelector('#t-icon').value.trim(),
+        parent:parent||null,
       })});
       etypes.set(t.name,t);
       after?after():closeSheet();
@@ -1103,12 +1153,16 @@ function openEditType(t,after){
     </div>
     <label>Icon (emoji/unicode, optional — overrides glyph)</label>
     <input type="text" id="t-icon" maxlength="8" value="${esc(t.icon||'')}" placeholder="⚓">
+    <label>Is a (optional — inherits valid-target rules from this type)</label>
+    ${dropdownHTML('c-parent',parentOptions(t.name),t.parent||'')}
     <div class="row">
       <button class="btn" id="a-save">Save</button>
       ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
     </div>
     <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`);
 
+  let parent=t.parent||'';
+  wireDropdown('c-parent',v=>parent=v);
   body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
   body.querySelector('#a-save').onclick=async()=>{
     try{
@@ -1116,6 +1170,7 @@ function openEditType(t,after){
         glyph:body.querySelector('#t-glyph').value.trim()||t.glyph,
         color:body.querySelector('#t-color').value,
         icon:body.querySelector('#t-icon').value.trim(),
+        parent:parent||null,
       })});
       etypes.set(u.name,u);
       render();
@@ -1167,49 +1222,91 @@ function openNewRel(after){
   };
 }
 
+// Renders the current validPairs list as removable rows, plus a small
+// "add rule" form (from-dropdown + to-checkboxes). Purely client-side
+// soft guidance — see isValidPair() — so there is nothing to validate
+// beyond "does the referenced type still exist," done in cleanValidPairs
+// on save (server) and just skipped here if stale.
+function renderPairRules(pairs){
+  if(!pairs.length) return '<div class="mini">No rules — any entity types may link with this type.</div>';
+  return pairs.map((p,i)=>
+    `<div class="prop" style="display:flex;align-items:center;gap:8px" data-pair-i="${i}">
+      <span style="flex:1">${esc(p.from)} → ${p.to.map(esc).join(', ')}</span>
+      <button class="btn ghost small" data-rmpair="${i}" type="button">✕</button>
+    </div>`).join('');
+}
+
 function openEditRel(t,after){
-  openSheet(`
+  let pairs=(t.validPairs||[]).map(p=>({from:p.from,to:[...p.to]}));
+  let directed=t.directed;
+  const etypeOpts=[...etypes.values()].map(e=>e.name);
+
+  const html=()=>`
     <h2>Edit relationship type</h2>
     <div class="sub">${esc(t.name)}${t.builtin?' · built-in':''}</div>
     <div class="split">
       <div>
         <label>Direction</label>
         <div class="chips" id="c-dir" data-kind="conf">
-          <button class="chip ${t.directed?'on':''}" data-v="1"
-            style="border-color:var(--faint)${t.directed?';background:var(--faint)':''}">directed</button>
-          <button class="chip ${t.directed?'':'on'}" data-v="0"
-            style="border-color:var(--faint)${t.directed?'':';background:var(--faint)'}">undirected</button>
+          <button class="chip ${directed?'on':''}" data-v="1"
+            style="border-color:var(--faint)${directed?';background:var(--faint)':''}">directed</button>
+          <button class="chip ${directed?'':'on'}" data-v="0"
+            style="border-color:var(--faint)${directed?'':';background:var(--faint)'}">undirected</button>
         </div>
       </div>
       <div><label>Colour</label><input type="color" id="t-color" value="${esc(t.color)}"></div>
     </div>
+    <label>Valid targets ${directed?'(from → to)':'(either side, since this type is undirected)'}</label>
+    <div id="pair-rows">${renderPairRules(pairs)}</div>
+    <div class="split">
+      <div><label>From type</label>${dropdownHTML('c-pfrom',etypeOpts.map(n=>({value:n,label:n})),etypeOpts[0])}</div>
+      <div><label>To type(s)</label>
+        <select id="c-pto" multiple size="4">
+          ${etypeOpts.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="row"><button class="btn ghost small" id="a-addpair" type="button">+ Add rule</button></div>
     <div class="row">
       <button class="btn" id="a-save">Save</button>
       ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
     </div>
-    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`);
+    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`;
 
-  let directed=t.directed;
-  wireChips('#c-dir',v=>directed=v==='1');
-  body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
-  body.querySelector('#a-save').onclick=async()=>{
-    try{
-      const u=await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
-        directed, color:body.querySelector('#t-color').value,
-      })});
-      rtypes.set(u.name,u);
-      render();
-      after?after():closeSheet();
-    }catch(e){ toast('Save failed: '+e.message); }
-  };
-  const delBtn=body.querySelector('#a-del');
-  if(delBtn) delBtn.onclick=async()=>{
-    try{
-      await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'DELETE'});
-      rtypes.delete(t.name);
-      after?after():closeSheet();
-    }catch(e){ toast('Delete failed: '+e.message); }
-  };
+  let pfrom=etypeOpts[0];
+  function wire(){
+    openSheet(html());
+    wireChips('#c-dir',v=>directed=v==='1');
+    wireDropdown('c-pfrom',v=>pfrom=v);
+    body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
+    body.querySelector('#a-addpair').onclick=()=>{
+      const to=[...body.querySelector('#c-pto').selectedOptions].map(o=>o.value);
+      if(!to.length){ toast('Pick at least one target type'); return; }
+      pairs.push({from:pfrom,to});
+      wire();
+    };
+    body.querySelectorAll('[data-rmpair]').forEach(b=>
+      b.onclick=()=>{ pairs.splice(Number(b.dataset.rmpair),1); wire(); });
+    body.querySelector('#a-save').onclick=async()=>{
+      try{
+        const u=await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
+          directed, color:body.querySelector('#t-color').value, validPairs:pairs,
+        })});
+        rtypes.set(u.name,u);
+        render();
+        after?after():closeSheet();
+      }catch(e){ toast('Save failed: '+e.message); }
+    };
+    const delBtn=body.querySelector('#a-del');
+    if(delBtn) delBtn.onclick=async()=>{
+      try{
+        await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'DELETE'});
+        rtypes.delete(t.name);
+        after?after():closeSheet();
+      }catch(e){ toast('Delete failed: '+e.message); }
+    };
+  }
+  wire();
 }
 
 // ---- manage types (list, edit, delete) ----
