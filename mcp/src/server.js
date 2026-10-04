@@ -10,7 +10,7 @@ const server = new Server({
   version: '0.1.0',
 },
 {
-  capatilities: {
+  capabilities: {
     tools: {},
     resources: {}
   },
