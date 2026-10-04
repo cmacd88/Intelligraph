@@ -73,7 +73,7 @@ export const graphApi = {
   },
 
   async createEdge(fromUid, type, toUid, props = {}, sourceUid = null, confidence = 'unconfirmed') {
-    const res = await client.post('/edges', { fromUid, type, toUid, props, sourceUid, confidence });
+    const res = await client.post('/edges', { fromUid, type, toUid, props, source_Uid, confidence });
     return res.data;
   },
 
