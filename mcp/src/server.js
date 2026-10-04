@@ -195,6 +195,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'pdf.read',
+        description: 'Fetch and extract text from a PDF URL',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'URL to the PDF' },
+          },
+          required: ['url'],
+        },
+      },
+      {
         name: 'types.listEntity',
         description: 'List all entity types',
         inputSchema: { type: 'object', properties: {} },
@@ -276,6 +287,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'source.list': {
         const result = await graphApi.getSources();
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'pdf.read': {
+        const result = await graphApi.readPdf(args.url);
+        return { content: [{ type: 'text', text: result.text }] };
       }
 
       default:

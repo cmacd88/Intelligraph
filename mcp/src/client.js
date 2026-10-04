@@ -128,6 +128,17 @@ export const graphApi = {
     const res = await client.get('/health');
     return res.data;
   },
+
+  async readPdf(url) {
+    // Fetch PDF from URL
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    const pdfBuffer = Buffer.from(response.data);
+    
+    // Parse PDF (requires pdf-parse library)
+    const pdf = await pdfParse(pdfBuffer);
+    return { text: pdf.text, pages: pdf.numpages };
+  },
+
 };
 
 export default graphApi;
