@@ -78,6 +78,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: 'relationship.create',
+        description: 'Create a relationship between two entities',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            fromUid: { type: 'string', description: 'Source entity UID' },
+            type: { type: 'string', description: 'Relationship type' },
+            toUid: { type: 'string', description: 'Target entity UID' },
+            props: { type: 'object', description: 'Custom properties (optional)' },
+            sourceUid: { type: 'string', description: 'Source UID if attributed (optional)' },
+            confidence: { type: 'string', description: 'confirmed | probable | unconfirmed', default: 'unconfirmed' },
+          },
+          required: ['fromUid', 'type', 'toUid'],
+        },
+      },
+      {
+        name: 'source.create',
+        description: 'Create a new source (provenance record)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            label: { type: 'string', description: 'Source label' },
+            url: { type: 'string', description: 'Source URL' },
+            kind: { type: 'string', description: 'Kind of source (e.g. web, document)', default: 'web' },
+            notes: { type: 'string', description: 'Free-text notes (optional)' },
+          },
+          required: ['label', 'url'],
+        },
+      },
+      {
         name: 'graph.search',
         description: 'Full-text search for entities by name or notes',
         inputSchema: {
@@ -189,6 +219,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'graph.neighbors': {
         const result = await graphApi.neighbors(args.uid, args.depth);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'relationship.create': {
+        const result = await graphApi.createEdge(args.fromUid, args.type, args.toUid, args.props, args.sourceUid, args.confidence);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'source.create': {
+        const result = await graphApi.createSource(args.label, args.url, args.kind, args.notes);
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 

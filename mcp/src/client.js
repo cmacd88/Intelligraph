@@ -95,12 +95,12 @@ export const graphApi = {
 
   async getEntityTypes() {
     const res = await client.get('/types');
-    return res.data.entityTypes || [];
+    return res.data.entities || [];
   },
 
   async getRelationshipTypes() {
     const res = await client.get('/types');
-    return res.data.relationshipTypes || [];
+    return res.data.relationships || [];
   },
 
   // Source endpoints
