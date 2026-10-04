@@ -8,6 +8,12 @@ import graphApi from './client.js';
 const server = new Server({
   name: 'intelligraph-mcp',
   version: '0.1.0',
+},
+{
+  capatilities: {
+    tools: {},
+    resources: {}
+  },
 });
 
 // ============================================================================
