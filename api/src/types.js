@@ -30,6 +30,54 @@ function parseValidPairs(raw) {
   }
 }
 
+// Recognised field kinds for the structured-properties builder. 'select'
+// carries its own `options` (string[]); the others are just typed input —
+// a kind decides which control the client renders, not how the value is
+// stored (still a plain string in props, same as every other property,
+// so nothing about entity/edge storage or the free-text fallback needs to
+// change).
+const FIELD_KINDS = ['text', 'number', 'date', 'boolean', 'select'];
+
+// fieldSchema is stored the same way as validPairs: a JSON string holding
+// an array of {key, label, kind, options?}.
+function parseFieldSchema(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// Drops malformed entries the same permissive way cleanValidPairs does —
+// this defines what fields the GUI offers, not a write-time constraint, so
+// a bad entry just fails to appear as a field rather than blocking a save.
+function cleanFieldSchema(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  return raw
+    .map((entry) => {
+      if (!entry || typeof entry.key !== 'string' || !entry.key.trim()) return null;
+      const key = entry.key.trim();
+      if (seen.has(key)) return null; // first definition of a key wins
+      const kind = FIELD_KINDS.includes(entry.kind) ? entry.kind : 'text';
+      const label = typeof entry.label === 'string' && entry.label.trim()
+        ? entry.label.trim() : key;
+      const out = { key, label, kind };
+      if (kind === 'select') {
+        const options = Array.isArray(entry.options)
+          ? entry.options.filter((o) => typeof o === 'string' && o.trim()).map((o) => o.trim())
+          : [];
+        if (!options.length) return null; // a select with no options isn't renderable
+        out.options = options;
+      }
+      seen.add(key);
+      return out;
+    })
+    .filter(Boolean);
+}
+
 async function loadRegistry() {
   const e = await read('MATCH (t:_EntityType) RETURN t ORDER BY t.name');
   const r = await read('MATCH (t:_RelType) RETURN t ORDER BY t.name');
@@ -49,6 +97,10 @@ async function loadRegistry() {
         // hierarchy — see isDescendantOf() below. Absent/null means this
         // type has no ancestor.
         parent: p.parent || null,
+        // Structured-properties fields defined on this type specifically.
+        // Use effectiveFieldSchema() to also pick up inherited fields from
+        // `parent` — this raw list is just what's defined here.
+        fieldSchema: parseFieldSchema(p.fieldSchema),
         builtin: p.builtin === true,
       }];
     }),
@@ -66,6 +118,9 @@ async function loadRegistry() {
         // named here also matches any of its descendants (via `parent`).
         // Empty list = unrestricted, same as the field being absent.
         validPairs: parseValidPairs(p.validPairs),
+        // Relationship types have no hierarchy, so this is just their own
+        // fields — no inheritance to account for, unlike entity types.
+        fieldSchema: parseFieldSchema(p.fieldSchema),
         builtin: p.builtin === true,
       }];
     }),
@@ -115,6 +170,32 @@ function isDescendantOf(typeName, ancestorName) {
 
 /** True if `typeName` is `ancestorName` or descends from it, per parent chain. */
 const matchesTypeOrAncestor = (typeName, ancestorName) => isDescendantOf(typeName, ancestorName);
+
+/**
+ * The full set of structured-properties fields a GUI should offer for
+ * `typeName`: its own fieldSchema plus every ancestor's, ancestor-first
+ * (root to most specific) so a more specific type's fields render after
+ * the general ones it inherited. A key defined again further down the
+ * chain overrides the ancestor's definition of the same key rather than
+ * duplicating it — e.g. Nonprofit can redefine a field Organization also
+ * defines, and only the Nonprofit version is offered.
+ */
+function effectiveEntityFieldSchema(typeName) {
+  const chain = [];
+  let current = entityTypes.get(typeName);
+  let hops = 0;
+  while (current && hops <= entityTypes.size) {
+    chain.unshift(current);
+    if (!current.parent) break;
+    current = entityTypes.get(current.parent);
+    hops += 1;
+  }
+  const byKey = new Map();
+  for (const t of chain) {
+    for (const field of (t.fieldSchema || [])) byKey.set(field.key, field);
+  }
+  return [...byKey.values()];
+}
 
 /**
  * Detects whether setting `child`'s parent to `parentName` would create a
@@ -182,7 +263,7 @@ function cleanValidPairs(raw) {
 }
 
 async function addEntityType({
-  name, color, glyph, icon, parent,
+  name, color, glyph, icon, parent, fieldSchema,
 }) {
   if (!validName(name)) {
     throw bad('Type name must start with a letter and contain only letters, digits and underscore');
@@ -193,7 +274,8 @@ async function addEntityType({
   await write(
     `MERGE (t:_EntityType {name: $name})
      ON CREATE SET t.color = $color, t.glyph = $glyph, t.icon = $icon,
-                    t.parent = $parent, t.builtin = false
+                    t.parent = $parent, t.fieldSchema = $fieldSchema,
+                    t.builtin = false
      RETURN t`,
     {
       name,
@@ -201,6 +283,7 @@ async function addEntityType({
       glyph: (glyph || name.slice(0, 2)).toUpperCase().slice(0, 2),
       icon: cleanIcon(icon),
       parent: parent || null,
+      fieldSchema: JSON.stringify(cleanFieldSchema(fieldSchema)),
     },
   );
   await loadRegistry();
@@ -208,7 +291,7 @@ async function addEntityType({
 }
 
 async function addRelType({
-  name, directed = true, color, validPairs,
+  name, directed = true, color, validPairs, fieldSchema,
 }) {
   const upper = typeof name === 'string' ? name.toUpperCase() : name;
   if (!validName(upper)) throw bad('Invalid relationship type name');
@@ -216,13 +299,15 @@ async function addRelType({
   await write(
     `MERGE (t:_RelType {name: $name})
      ON CREATE SET t.directed = $directed, t.color = $color,
-                    t.validPairs = $validPairs, t.builtin = false
+                    t.validPairs = $validPairs, t.fieldSchema = $fieldSchema,
+                    t.builtin = false
      RETURN t`,
     {
       name: upper,
       directed: directed !== false,
       color: cleanColor(color, '#475569'),
       validPairs: JSON.stringify(cleanValidPairs(validPairs)),
+      fieldSchema: JSON.stringify(cleanFieldSchema(fieldSchema)),
     },
   );
   await loadRegistry();
@@ -235,7 +320,7 @@ async function addRelType({
  * built-in set.
  */
 async function updateEntityType(name, {
-  color, glyph, icon, parent,
+  color, glyph, icon, parent, fieldSchema,
 }) {
   const t = entityTypes.get(name);
   if (!t) throw bad('Unknown type', 404);
@@ -252,6 +337,7 @@ async function updateEntityType(name, {
     }
     patch.parent = nextParent;
   }
+  if (fieldSchema !== undefined) patch.fieldSchema = JSON.stringify(cleanFieldSchema(fieldSchema));
 
   await write(
     'MATCH (t:_EntityType {name: $name}) SET t += $patch RETURN t',
@@ -261,7 +347,7 @@ async function updateEntityType(name, {
   return entityTypes.get(name);
 }
 
-async function updateRelType(name, { directed, color, validPairs }) {
+async function updateRelType(name, { directed, color, validPairs, fieldSchema }) {
   const t = relTypes.get(name);
   if (!t) throw bad('Unknown type', 404);
 
@@ -269,6 +355,7 @@ async function updateRelType(name, { directed, color, validPairs }) {
   if (directed !== undefined) patch.directed = directed !== false;
   if (color !== undefined) patch.color = cleanColor(color, t.color);
   if (validPairs !== undefined) patch.validPairs = JSON.stringify(cleanValidPairs(validPairs));
+  if (fieldSchema !== undefined) patch.fieldSchema = JSON.stringify(cleanFieldSchema(fieldSchema));
 
   await write(
     'MATCH (t:_RelType {name: $name}) SET t += $patch RETURN t',
@@ -321,5 +408,5 @@ module.exports = {
   loadRegistry, isEntityType, isRelType, listTypes,
   addEntityType, addRelType, deleteEntityType, deleteRelType,
   updateEntityType, updateRelType, validName,
-  isDescendantOf, isValidPair,
+  isDescendantOf, isValidPair, effectiveEntityFieldSchema, FIELD_KINDS,
 };

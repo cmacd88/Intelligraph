@@ -132,11 +132,21 @@ textarea{height:76px;resize:vertical}
 <div id="backdrop"></div>
 <div id="sheet"><div class="grab"></div><div id="body"></div></div>
 
+<!-- Written by the web container's entrypoint from its own API_PORT env
+     var (see web/docker-entrypoint.sh) — not cached by the HTML's own
+     cache headers, so each container always serves its own stack's port,
+     even when two stacks share this same image. -->
+<script src="config.js"></script>
 <script>
 'use strict';
 
-// API is same-origin when proxied, else port 4000 on whatever host served this.
-const API = window.__API_URL__ || `${location.protocol}//${location.hostname}:4000`;
+// API is same-origin when __API_URL__ is set directly (e.g. reverse-proxy
+// deployments); otherwise the same host this page loaded from, on the
+// API's host-published port from config.js — falling back to 4000 only if
+// that somehow failed to load, so a stale/missing config.js degrades to
+// the old default rather than breaking outright.
+const API = window.__API_URL__
+  || `${location.protocol}//${location.hostname}:${window.__API_PORT__ || 4000}`;
 
 const NS='http://www.w3.org/2000/svg';
 const R=26, HIT=R+16;
@@ -158,6 +168,30 @@ const svg=$('canvas'), sheet=$('sheet'), body=$('body'),
 
 const byUid=u=>nodes.find(n=>n.uid===u);
 const degree=u=>edges.filter(e=>e.from===u||e.to===u).length;
+
+// Finds an empty spot near (cx,cy) in graph space, so repeatedly creating
+// nodes without panning doesn't stack them on top of each other. Spirals
+// outward in rings of 8 candidate points, each ring further out, until one
+// clears MIN_GAP from every existing node; falls back to the farthest-out
+// candidate tried if the graph is absurdly dense (should never trigger in
+// practice, but a loop that can fail to terminate is a bug).
+function findFreeSpot(cx,cy){
+  const MIN_GAP=R*2.4;
+  const clear=(x,y)=>nodes.every(n=>Math.hypot(n.x-x,n.y-y)>=MIN_GAP);
+  if(clear(cx,cy)) return {x:cx,y:cy};
+  let lastTried={x:cx,y:cy};
+  for(let ring=1;ring<=12;ring++){
+    const dist=MIN_GAP*ring*0.9;
+    const pointsOnRing=6+ring*2; // denser rings further out, fewer gaps to miss
+    for(let i=0;i<pointsOnRing;i++){
+      const a=2*Math.PI*i/pointsOnRing+ring*0.5; // offset per ring avoids radial alignment
+      const x=cx+Math.cos(a)*dist, y=cy+Math.sin(a)*dist;
+      lastTried={x,y};
+      if(clear(x,y)) return {x,y};
+    }
+  }
+  return lastTried;
+}
 const tstyle=t=>etypes.get(t)||{color:'#6b7280',glyph:'??',icon:''};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -713,6 +747,56 @@ const parseProps=s=>{
 };
 const printProps=p=>Object.entries(p||{}).map(([k,v])=>`${k}: ${v}`).join('\n');
 
+// ---- structured fields in create/edit sheets ----
+// Renders one typed input per field in `fields` (a type's effective
+// schema), pre-filled from `values` (the entity/edge's current props).
+// Fields not in the schema stay out of the free-text box's way entirely —
+// the textarea is reserved for whatever isn't covered here.
+function fieldInputsHTML(fields,values){
+  values=values||{};
+  if(!fields.length) return '';
+  return fields.map(f=>{
+    const v=values[f.key];
+    const id='ff-'+f.key;
+    if(f.kind==='boolean'){
+      const checked=v==='true'||v===true;
+      return `<label><input type="checkbox" id="${id}" ${checked?'checked':''} style="width:auto;margin-right:6px;vertical-align:middle">${esc(f.label)}</label>`;
+    }
+    if(f.kind==='select'){
+      const opts=f.options.map(o=>`<option value="${esc(o)}"${o===v?' selected':''}>${esc(o)}</option>`).join('');
+      return `<label>${esc(f.label)}</label><select id="${id}"><option value="">—</option>${opts}</select>`;
+    }
+    const type=f.kind==='number'?'number':f.kind==='date'?'date':'text';
+    return `<label>${esc(f.label)}</label><input type="${type}" id="${id}" value="${esc(v||'')}">`;
+  }).join('');
+}
+
+// Reads fieldInputsHTML()'s controls back into a {key:value} object. Only
+// emits a key when it has a value, so clearing a field removes it from
+// props rather than writing an empty string — a blank select/date/text
+// shouldn't overwrite a prior value with "".
+function readFieldInputs(fields){
+  const out={};
+  for(const f of fields){
+    const el=body.querySelector('#ff-'+f.key);
+    if(!el) continue;
+    if(f.kind==='boolean'){ out[f.key]=el.checked?'true':'false'; continue; }
+    const v=el.value;
+    if(v!=='') out[f.key]=v;
+  }
+  return out;
+}
+
+// Property keys already rendered as typed fields are dropped from the
+// free-text textarea's own view/parse, so the same value doesn't appear
+// (and get double-written) in both places.
+const otherProps=(props,fields)=>{
+  const keys=new Set(fields.map(f=>f.key));
+  const out={};
+  for(const [k,v] of Object.entries(props||{})) if(!keys.has(k)) out[k]=v;
+  return out;
+};
+
 const confChips=s=>CONFIDENCE.map(c=>
   `<button class="chip ${c===s?'on':''}" data-v="${c}"
     style="border-color:var(--faint)${c===s?';background:var(--faint);color:#e2e8f0':''}">${c}</button>`
@@ -781,7 +865,50 @@ document.addEventListener('click',()=>{
 
 const sourceOptions=s=>
   `<option value="">— none —</option>`+
+  `<option value="__new__">+ new source…</option>`+
   sources.map(x=>`<option value="${x.uid}"${x.uid===s?' selected':''}>${esc(x.label)}</option>`).join('');
+
+// Small inline "+ new source" form, shown/hidden under the source
+// dropdown. Call wireSourcePicker() after inserting this HTML + the
+// dropdown into a sheet; it shows the form when "__new__" is selected and
+// hides it (restoring the dropdown to "none") otherwise. onCreated(uid) is
+// called once the source is actually created, so the caller can stash the
+// uid for its own save.
+const newSourceFormHTML=()=>`
+  <div id="new-source-form" style="display:none;margin-top:8px">
+    <input type="text" id="ns-label" placeholder="Label, e.g. LinkedIn profile">
+    <input type="text" id="ns-url" placeholder="URL (optional)" style="margin-top:6px">
+    <div class="row">
+      <button class="btn small" id="a-ns-create" type="button">Add source</button>
+      <button class="btn ghost small" id="a-ns-cancel" type="button">Cancel</button>
+    </div>
+  </div>`;
+
+function wireSourcePicker(selectId,onCreated){
+  const sel=body.querySelector('#'+selectId);
+  const form=body.querySelector('#new-source-form');
+  if(!sel||!form) return;
+  sel.onchange=()=>{
+    if(sel.value==='__new__'){ form.style.display='block'; body.querySelector('#ns-label').focus(); }
+    else form.style.display='none';
+  };
+  body.querySelector('#a-ns-cancel').onclick=()=>{ sel.value=''; form.style.display='none'; };
+  body.querySelector('#a-ns-create').onclick=async()=>{
+    const label=body.querySelector('#ns-label').value.trim();
+    if(!label){ toast('Label required'); return; }
+    try{
+      const s=await req('/sources',{method:'POST',body:JSON.stringify({
+        label, url:body.querySelector('#ns-url').value.trim()||null,
+      })});
+      sources.push(s);
+      const opt=document.createElement('option');
+      opt.value=s.uid; opt.textContent=s.label; opt.selected=true;
+      sel.insertBefore(opt,sel.querySelector('option[value="__new__"]').nextSibling);
+      form.style.display='none';
+      onCreated&&onCreated(s.uid);
+    }catch(e){ toast('Could not add source: '+e.message); }
+  };
+}
 
 // ---- inspect ----
 function openInspect(n){
@@ -807,6 +934,11 @@ function openInspect(n){
     <div class="row">
       <button class="btn ghost small" id="a-path">Find path from here</button>
       <button class="btn ghost small" id="a-hide">Hide</button>
+    </div>
+    <label>Arrange direct children</label>
+    <div class="row">
+      <button class="btn ghost small" id="a-circle">Circle</button>
+      <button class="btn ghost small" id="a-pyramid">Pyramid</button>
     </div>
     <div class="row">
       <button class="btn ghost small" id="a-fold">${collapsed.has(n.uid)?'Uncollapse'
@@ -857,6 +989,9 @@ function openInspect(n){
 
   body.querySelector('#a-edit').onclick=()=>openEdit(n);
 
+  body.querySelector('#a-circle').onclick=()=>{ closeSheet(); layoutCircle(n); };
+  body.querySelector('#a-pyramid').onclick=()=>{ closeSheet(); layoutPyramid(n); };
+
   body.querySelector('#a-fold').onclick=()=>{
     if(collapsed.has(n.uid)){
       collapsed.delete(n.uid); closeSheet(); render(); setStatus(); return;
@@ -882,96 +1017,167 @@ function openInspect(n){
   };
 }
 
+// ---- layout tools ----
+// "Children" = entities this node links to via an outgoing edge. An
+// undirected relationship type has no meaningful direction (see
+// api/src/types.js), so it never produces a child either way — only
+// edges actually stored as from:n.uid count, regardless of the type's
+// directed flag, since the stored direction is what a layout can draw.
+const directChildren=uid=>
+  edges.filter(e=>e.from===uid).map(e=>byUid(e.to)).filter(Boolean);
+
+// Persists every moved node's new position. Fire-and-forget per node,
+// same as the existing drag-end save — a failed save just means that
+// node's position didn't stick, reported once rather than per-node.
+function savePositions(moved){
+  Promise.all(moved.map(n=>
+    req(`/entities/${n.uid}`,{method:'PATCH',
+      body:JSON.stringify({x:Math.round(n.x),y:Math.round(n.y)})})
+  )).catch(()=>toast('Some positions did not save'));
+}
+
+// Selected node centered, its direct children spaced evenly on a ring
+// around it. Re-centers the camera on the result since the arrangement
+// is built around (0 offset from) the selected node's current position.
+function layoutCircle(n){
+  const kids=directChildren(n.uid);
+  if(!kids.length){ toast('No outgoing links from this entity'); return; }
+  const dist=Math.max(140,kids.length*22);
+  kids.forEach((k,i)=>{
+    const a=2*Math.PI*i/kids.length-Math.PI/2;
+    k.x=n.x+Math.cos(a)*dist; k.y=n.y+Math.sin(a)*dist;
+  });
+  render(); setStatus(); savePositions(kids);
+}
+
+// Selected node on top, direct children in a row beneath it — one tier,
+// matching "direct children only" rather than a full recursive tree.
+function layoutPyramid(n){
+  const kids=directChildren(n.uid);
+  if(!kids.length){ toast('No outgoing links from this entity'); return; }
+  const GAP=Math.max(R*3.2,110);
+  const tierY=n.y+180;
+  const startX=n.x-GAP*(kids.length-1)/2;
+  kids.forEach((k,i)=>{ k.x=startX+GAP*i; k.y=tierY; });
+  render(); setStatus(); savePositions(kids);
+}
+
 // ---- create ----
 function openCreate(){
   let type=[...etypes.keys()][0]||'Person';
-  openSheet(`
-    <h2>New entity</h2>
-    <label>Name</label>
-    <input type="text" id="f-name" placeholder="e.g. Alice Nordmann">
-    <label>Type <button class="linkbtn" id="a-newtype" style="margin:0 0 0 8px">+ new type</button></label>
-    ${dropdownHTML('c-type',[...etypes.values()].map(t=>({value:t.name,label:t.name,color:t.color})),type)}
-    <label>Properties (key: value per line)</label>
-    <textarea id="f-props" placeholder="role: Engineer&#10;country: NO"></textarea>
-    <label>Notes</label>
-    <textarea id="f-notes" style="height:56px"></textarea>
-    <label>Source</label>
-    <select id="f-source">${sourceOptions()}</select>
-    <div class="row">
-      <button class="btn" id="a-save">Create</button>
-      <button class="btn ghost" id="a-cancel">Cancel</button>
-    </div>`);
+  let pendingSourceUid=null;
+  let extra={}; // free-text props kept across a type switch, when still relevant
 
-  wireDropdown('c-type',v=>type=v);
-  body.querySelector('#a-cancel').onclick=closeSheet;
-  body.querySelector('#a-newtype').onclick=()=>openNewType(()=>openCreate());
+  function wire(){
+    const fields=effectiveEntityFieldSchema(type);
+    openSheet(`
+      <h2>New entity</h2>
+      <label>Name</label>
+      <input type="text" id="f-name" placeholder="e.g. Alice Nordmann">
+      <label>Type <button class="linkbtn" id="a-newtype" style="margin:0 0 0 8px">+ new type</button></label>
+      ${dropdownHTML('c-type',[...etypes.values()].map(t=>({value:t.name,label:t.name,color:t.color})),type)}
+      ${fieldInputsHTML(fields,extra)}
+      <label>Other properties (key: value per line)</label>
+      <textarea id="f-props" placeholder="role: Engineer&#10;country: NO">${esc(printProps(otherProps(extra,fields)))}</textarea>
+      <label>Notes</label>
+      <textarea id="f-notes" style="height:56px"></textarea>
+      <label>Source</label>
+      <select id="f-source">${sourceOptions(pendingSourceUid)}</select>
+      ${newSourceFormHTML()}
+      <div class="row">
+        <button class="btn" id="a-save">Create</button>
+        <button class="btn ghost" id="a-cancel">Cancel</button>
+      </div>`);
 
-  body.querySelector('#a-save').onclick=async()=>{
-    const name=body.querySelector('#f-name').value.trim();
-    if(!name){ toast('Name required'); return; }
-    const c=toGraph(svg.clientWidth/2,svg.clientHeight/2);
-    try{
-      const n=await req('/entities',{method:'POST',body:JSON.stringify({
-        name,type,
-        props:parseProps(body.querySelector('#f-props').value),
-        notes:body.querySelector('#f-notes').value,
-        source_uid:body.querySelector('#f-source').value||null,
-        x:Math.round(c.x),y:Math.round(c.y),
-      })});
-      nodes.push(n); closeSheet(); render(); setStatus();
-    }catch(e){ toast('Create failed: '+e.message); }
-  };
+    wireDropdown('c-type',v=>{
+      extra={...extra,...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+      type=v; wire();
+    });
+    wireSourcePicker('f-source',uid=>pendingSourceUid=uid);
+    body.querySelector('#a-cancel').onclick=closeSheet;
+    body.querySelector('#a-newtype').onclick=()=>openNewType(()=>openCreate());
+
+    body.querySelector('#a-save').onclick=async()=>{
+      const name=body.querySelector('#f-name').value.trim();
+      if(!name){ toast('Name required'); return; }
+      const srcSel=body.querySelector('#f-source').value;
+      if(srcSel==='__new__'){ toast('Finish adding the source, or cancel it, first'); return; }
+      const center=toGraph(svg.clientWidth/2,svg.clientHeight/2);
+      const c=findFreeSpot(center.x,center.y);
+      try{
+        const props={...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+        const n=await req('/entities',{method:'POST',body:JSON.stringify({
+          name,type,props,
+          notes:body.querySelector('#f-notes').value,
+          source_uid:srcSel||null,
+          x:Math.round(c.x),y:Math.round(c.y),
+        })});
+        nodes.push(n); closeSheet(); render(); setStatus();
+      }catch(e){ toast('Create failed: '+e.message); }
+    };
+  }
+  wire();
 }
 
 // ---- edit ----
 function openEdit(n){
   if(!n) return;
   let type=n.type;
-  openSheet(`
-    <h2>Edit entity</h2>
-    <label>Name</label>
-    <input type="text" id="f-name" value="${esc(n.name)}">
-    <label>Type</label>
-    ${dropdownHTML('c-type',[...etypes.values()].map(t=>({value:t.name,label:t.name,color:t.color})),type)}
-    <label>Properties</label>
-    <textarea id="f-props">${esc(printProps(n.props))}</textarea>
-    <label>Notes</label>
-    <textarea id="f-notes" style="height:56px">${esc(n.notes)}</textarea>
-    <div class="row">
-      <button class="btn" id="a-save">Save</button>
-      <button class="btn danger" id="a-del">Delete</button>
-    </div>
-    <div class="mini">Created ${esc((n.created||'').slice(0,10))}</div>`);
+  let extra={...n.props};
 
-  wireDropdown('c-type',v=>type=v);
+  function wire(){
+    const fields=effectiveEntityFieldSchema(type);
+    openSheet(`
+      <h2>Edit entity</h2>
+      <label>Name</label>
+      <input type="text" id="f-name" value="${esc(n.name)}">
+      <label>Type</label>
+      ${dropdownHTML('c-type',[...etypes.values()].map(t=>({value:t.name,label:t.name,color:t.color})),type)}
+      ${fieldInputsHTML(fields,extra)}
+      <label>Other properties</label>
+      <textarea id="f-props">${esc(printProps(otherProps(extra,fields)))}</textarea>
+      <label>Notes</label>
+      <textarea id="f-notes" style="height:56px">${esc(n.notes)}</textarea>
+      <div class="row">
+        <button class="btn" id="a-save">Save</button>
+        <button class="btn danger" id="a-del">Delete</button>
+      </div>
+      <div class="mini">Created ${esc((n.created||'').slice(0,10))}</div>`);
 
-  body.querySelector('#a-save').onclick=async()=>{
-    const name=body.querySelector('#f-name').value.trim();
-    if(!name){ toast('Name required'); return; }
-    try{
-      // type change rewrites the label, so it is a separate endpoint
-      if(type!==n.type) await req(`/entities/${n.uid}/type`,
-        {method:'PUT',body:JSON.stringify({type})});
-      const u=await req(`/entities/${n.uid}`,{method:'PATCH',body:JSON.stringify({
-        name,
-        props:parseProps(body.querySelector('#f-props').value),
-        notes:body.querySelector('#f-notes').value,
-      })});
-      Object.assign(n,u,{type});
-      closeSheet(); render(); setStatus();
-    }catch(e){ toast('Save failed: '+e.message); }
-  };
+    wireDropdown('c-type',v=>{
+      extra={...extra,...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+      type=v; wire();
+    });
 
-  body.querySelector('#a-del').onclick=async()=>{
-    try{
-      await req(`/entities/${n.uid}`,{method:'DELETE'});
-      nodes=nodes.filter(x=>x.uid!==n.uid);
-      edges=edges.filter(e=>e.from!==n.uid&&e.to!==n.uid);
-      collapsed.delete(n.uid);
-      if(focusUid===n.uid){ focusUid=null; focusDepth=0; }
-      sel=null; closeSheet(); render(); setStatus();
-    }catch(e){ toast('Delete failed: '+e.message); }
-  };
+    body.querySelector('#a-save').onclick=async()=>{
+      const name=body.querySelector('#f-name').value.trim();
+      if(!name){ toast('Name required'); return; }
+      try{
+        // type change rewrites the label, so it is a separate endpoint
+        if(type!==n.type) await req(`/entities/${n.uid}/type`,
+          {method:'PUT',body:JSON.stringify({type})});
+        const props={...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+        const u=await req(`/entities/${n.uid}`,{method:'PATCH',body:JSON.stringify({
+          name,props,
+          notes:body.querySelector('#f-notes').value,
+        })});
+        Object.assign(n,u,{type});
+        closeSheet(); render(); setStatus();
+      }catch(e){ toast('Save failed: '+e.message); }
+    };
+
+    body.querySelector('#a-del').onclick=async()=>{
+      try{
+        await req(`/entities/${n.uid}`,{method:'DELETE'});
+        nodes=nodes.filter(x=>x.uid!==n.uid);
+        edges=edges.filter(e=>e.from!==n.uid&&e.to!==n.uid);
+        collapsed.delete(n.uid);
+        if(focusUid===n.uid){ focusUid=null; focusDepth=0; }
+        sel=null; closeSheet(); render(); setStatus();
+      }catch(e){ toast('Delete failed: '+e.message); }
+    };
+  }
+  wire();
 }
 
 // ---- link ----
@@ -1005,91 +1211,164 @@ function openLink(from,to,showAll){
     [...rtypes.values()].filter(t=>isValidPair(t.name,from.type,to.type));
   const relList=relOpts.length?relOpts:[...rtypes.values()];
   let rel=relList[0]?.name, conf='unconfirmed';
+  let pendingSourceUid=null;
+  let extra={};
   const filtered=!showAll&&relOpts.length<rtypes.size;
-  openSheet(`
-    <h2>New relationship</h2>
-    <div class="sub">${esc(from.name)} → ${esc(to.name)}</div>
-    <label>Type <button class="linkbtn" id="a-newrel" style="margin:0 0 0 8px">+ new type</button></label>
-    ${dropdownHTML('c-rel',relList.map(t=>({value:t.name,label:t.name})),rel)}
-    ${filtered?`<div class="mini">Filtered to types valid for ${esc(from.type)} → ${esc(to.type)}. <span class="linkbtn" id="a-showall" style="cursor:pointer">Show all</span></div>`:''}
-    <label>Confidence</label>
-    <div class="chips" id="c-conf" data-kind="conf">${confChips(conf)}</div>
-    <label>Properties</label>
-    <textarea id="f-props" placeholder="since: 2020"></textarea>
-    <label>Source</label>
-    <select id="f-source">${sourceOptions()}</select>
-    <div class="row">
-      <button class="btn" id="a-save">Create</button>
-      <button class="btn ghost" id="a-cancel">Cancel</button>
-    </div>`);
 
-  wireDropdown('c-rel',v=>rel=v);
-  wireChips('#c-conf',v=>conf=v);
-  body.querySelector('#a-cancel').onclick=closeSheet;
-  body.querySelector('#a-newrel').onclick=()=>openNewRel(()=>openLink(from,to,showAll));
-  const showAllBtn=body.querySelector('#a-showall');
-  if(showAllBtn) showAllBtn.onclick=()=>openLink(from,to,true);
+  function wire(){
+    const fields=(rtypes.get(rel)||{}).fieldSchema||[];
+    openSheet(`
+      <h2>New relationship</h2>
+      <div class="sub">${esc(from.name)} → ${esc(to.name)}</div>
+      <label>Type <button class="linkbtn" id="a-newrel" style="margin:0 0 0 8px">+ new type</button></label>
+      ${dropdownHTML('c-rel',relList.map(t=>({value:t.name,label:t.name})),rel)}
+      ${filtered?`<div class="mini">Filtered to types valid for ${esc(from.type)} → ${esc(to.type)}. <span class="linkbtn" id="a-showall" style="cursor:pointer">Show all</span></div>`:''}
+      <label>Confidence</label>
+      <div class="chips" id="c-conf" data-kind="conf">${confChips(conf)}</div>
+      ${fieldInputsHTML(fields,extra)}
+      <label>Other properties</label>
+      <textarea id="f-props" placeholder="since: 2020">${esc(printProps(otherProps(extra,fields)))}</textarea>
+      <label>Source</label>
+      <select id="f-source">${sourceOptions(pendingSourceUid)}</select>
+      ${newSourceFormHTML()}
+      <div class="row">
+        <button class="btn" id="a-save">Create</button>
+        <button class="btn ghost" id="a-cancel">Cancel</button>
+      </div>`);
 
-  body.querySelector('#a-save').onclick=async()=>{
-    try{
-      const e=await req('/edges',{method:'POST',body:JSON.stringify({
-        from:from.uid,to:to.uid,type:rel,confidence:conf,
-        props:parseProps(body.querySelector('#f-props').value),
-        source_uid:body.querySelector('#f-source').value||null,
-      })});
-      edges.push(e); closeSheet(); render(); setStatus();
-    }catch(err){ toast('Link failed: '+err.message); }
-  };
+    wireDropdown('c-rel',v=>{
+      extra={...extra,...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+      rel=v; wire();
+    });
+    wireChips('#c-conf',v=>conf=v);
+    wireSourcePicker('f-source',uid=>pendingSourceUid=uid);
+    body.querySelector('#a-cancel').onclick=closeSheet;
+    body.querySelector('#a-newrel').onclick=()=>openNewRel(()=>openLink(from,to,showAll));
+    const showAllBtn=body.querySelector('#a-showall');
+    if(showAllBtn) showAllBtn.onclick=()=>openLink(from,to,true);
+
+    body.querySelector('#a-save').onclick=async()=>{
+      const srcSel=body.querySelector('#f-source').value;
+      if(srcSel==='__new__'){ toast('Finish adding the source, or cancel it, first'); return; }
+      try{
+        const props={...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+        const e=await req('/edges',{method:'POST',body:JSON.stringify({
+          from:from.uid,to:to.uid,type:rel,confidence:conf,props,
+          source_uid:srcSel||null,
+        })});
+        edges.push(e); closeSheet(); render(); setStatus();
+      }catch(err){ toast('Link failed: '+err.message); }
+    };
+  }
+  wire();
 }
 
 function openEdge(e){
   const a=byUid(e.from), b=byUid(e.to);
   let type=e.type, conf=e.confidence;
-  openSheet(`
-    <h2>Relationship</h2>
-    <div class="sub">${esc(a?a.name:'?')} → ${esc(b?b.name:'?')}</div>
-    <label>Type</label>
-    ${dropdownHTML('c-rel',[...rtypes.values()].map(t=>({value:t.name,label:t.name})),type)}
-    <label>Confidence</label>
-    <div class="chips" id="c-conf" data-kind="conf">${confChips(conf)}</div>
-    <label>Properties</label>
-    <textarea id="f-props">${esc(printProps(e.props))}</textarea>
-    <div class="row">
-      <button class="btn" id="a-save">Save</button>
-      <button class="btn danger" id="a-del">Delete</button>
-    </div>
-    <div class="mini">Added ${esc((e.added||'').slice(0,10))}</div>`);
+  let extra={...e.props};
 
-  wireDropdown('c-rel',v=>type=v);
-  wireChips('#c-conf',v=>conf=v);
+  function wire(){
+    const fields=(rtypes.get(type)||{}).fieldSchema||[];
+    openSheet(`
+      <h2>Relationship</h2>
+      <div class="sub">${esc(a?a.name:'?')} → ${esc(b?b.name:'?')}</div>
+      <label>Type</label>
+      ${dropdownHTML('c-rel',[...rtypes.values()].map(t=>({value:t.name,label:t.name})),type)}
+      <label>Confidence</label>
+      <div class="chips" id="c-conf" data-kind="conf">${confChips(conf)}</div>
+      ${fieldInputsHTML(fields,extra)}
+      <label>Other properties</label>
+      <textarea id="f-props">${esc(printProps(otherProps(extra,fields)))}</textarea>
+      <div class="row">
+        <button class="btn" id="a-save">Save</button>
+        <button class="btn danger" id="a-del">Delete</button>
+      </div>
+      <div class="mini">Added ${esc((e.added||'').slice(0,10))}</div>`);
 
-  body.querySelector('#a-save').onclick=async()=>{
-    try{
-      let cur=e;
-      // A type change is delete-and-recreate server side, so the
-      // elementId changes and the local edge must be swapped out.
-      if(type!==e.type){
-        cur=await req(`/edges/${encodeURIComponent(e.id)}/type`,
-          {method:'PUT',body:JSON.stringify({type})});
+    wireDropdown('c-rel',v=>{
+      extra={...extra,...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+      type=v; wire();
+    });
+    wireChips('#c-conf',v=>conf=v);
+
+    body.querySelector('#a-save').onclick=async()=>{
+      try{
+        let cur=e;
+        // A type change is delete-and-recreate server side, so the
+        // elementId changes and the local edge must be swapped out.
+        if(type!==e.type){
+          cur=await req(`/edges/${encodeURIComponent(e.id)}/type`,
+            {method:'PUT',body:JSON.stringify({type})});
+          edges=edges.filter(x=>x.id!==e.id);
+          edges.push(cur);
+        }
+        const props={...readFieldInputs(fields),...parseProps(body.querySelector('#f-props').value)};
+        const u=await req(`/edges/${encodeURIComponent(cur.id)}`,{method:'PATCH',
+          body:JSON.stringify({confidence:conf,props})});
+        const i=edges.findIndex(x=>x.id===u.id);
+        if(i>=0) edges[i]=u;
+        sel=null; closeSheet(); render(); setStatus();
+      }catch(err){ toast('Save failed: '+err.message); }
+    };
+
+    body.querySelector('#a-del').onclick=async()=>{
+      try{
+        await req(`/edges/${encodeURIComponent(e.id)}`,{method:'DELETE'});
         edges=edges.filter(x=>x.id!==e.id);
-        edges.push(cur);
-      }
-      const u=await req(`/edges/${encodeURIComponent(cur.id)}`,{method:'PATCH',
-        body:JSON.stringify({confidence:conf,
-          props:parseProps(body.querySelector('#f-props').value)})});
-      const i=edges.findIndex(x=>x.id===u.id);
-      if(i>=0) edges[i]=u;
-      sel=null; closeSheet(); render(); setStatus();
-    }catch(err){ toast('Save failed: '+err.message); }
-  };
+        sel=null; closeSheet(); render(); setStatus();
+      }catch(err){ toast('Delete failed: '+err.message); }
+    };
+  }
+  wire();
+}
 
-  body.querySelector('#a-del').onclick=async()=>{
-    try{
-      await req(`/edges/${encodeURIComponent(e.id)}`,{method:'DELETE'});
-      edges=edges.filter(x=>x.id!==e.id);
-      sel=null; closeSheet(); render(); setStatus();
-    }catch(err){ toast('Delete failed: '+err.message); }
-  };
+// ---- structured properties (per-type field schema) ----
+const FIELD_KINDS=['text','number','date','boolean','select'];
+const FIELD_KIND_LABEL={text:'Text',number:'Number',date:'Date',boolean:'Checkbox',select:'Dropdown (select one)'};
+
+// Mirrors api/src/types.js effectiveEntityFieldSchema(): a type's own
+// fields plus every ancestor's, root-first, with a key defined again
+// further down the chain overriding the ancestor's definition of that
+// same key. Entity types only — relationship types have no hierarchy.
+function effectiveEntityFieldSchema(typeName){
+  const chain=[];
+  let cur=etypes.get(typeName), hops=0;
+  while(cur&&hops<=etypes.size){
+    chain.unshift(cur);
+    if(!cur.parent) break;
+    cur=etypes.get(cur.parent); hops++;
+  }
+  const byKey=new Map();
+  for(const t of chain) for(const f of (t.fieldSchema||[])) byKey.set(f.key,f);
+  return [...byKey.values()];
+}
+
+// Renders the current fieldSchema list as removable rows, plus a small
+// "add field" form. Shared between the entity-type and relationship-type
+// editors since the shape ({key,label,kind,options?}) is identical.
+function renderFieldRows(fields){
+  if(!fields.length) return '<div class="mini">No fields defined — new entities/edges of this type get only the free-text properties box.</div>';
+  return fields.map((f,i)=>
+    `<div class="prop" style="display:flex;align-items:center;gap:8px" data-field-i="${i}">
+      <span style="flex:1">${esc(f.label)} <span class="rtype">${esc(f.key)} · ${FIELD_KIND_LABEL[f.kind]||f.kind}</span>
+        ${f.kind==='select'?`<span class="mini">${f.options.map(esc).join(', ')}</span>`:''}</span>
+      <button class="btn ghost small" data-rmfield="${i}" type="button">✕</button>
+    </div>`).join('');
+}
+
+// The "add field" sub-form, re-rendered whenever the kind picker changes
+// so the options textarea only shows up for kind==='select'.
+function fieldAddFormHTML(kind){
+  return `
+    <div class="split">
+      <div><label>Key</label><input type="text" id="nf-key" placeholder="e.g. jurisdiction"></div>
+      <div><label>Label (optional)</label><input type="text" id="nf-label" placeholder="defaults to key"></div>
+    </div>
+    <label>Kind</label>
+    ${dropdownHTML('c-nfkind',FIELD_KINDS.map(k=>({value:k,label:FIELD_KIND_LABEL[k]})),kind)}
+    ${kind==='select'?`<label>Options (one per line)</label><textarea id="nf-opts" style="height:56px" placeholder="NO&#10;US&#10;UK"></textarea>`:''}
+    <div class="row"><button class="btn ghost small" id="a-addfield" type="button">+ Add field</button></div>`;
 }
 
 // ---- new types ----
@@ -1144,7 +1423,11 @@ function openNewType(after){
 }
 
 function openEditType(t,after){
-  openSheet(`
+  let parent=t.parent||'';
+  let fields=(t.fieldSchema||[]).map(f=>({...f,options:f.options?[...f.options]:undefined}));
+  let newKind='text';
+
+  const html=()=>`
     <h2>Edit entity type</h2>
     <div class="sub">${esc(t.name)}${t.builtin?' · built-in':''}</div>
     <div class="split">
@@ -1153,38 +1436,63 @@ function openEditType(t,after){
     </div>
     <label>Icon (emoji/unicode, optional — overrides glyph)</label>
     <input type="text" id="t-icon" maxlength="8" value="${esc(t.icon||'')}" placeholder="⚓">
-    <label>Is a (optional — inherits valid-target rules from this type)</label>
-    ${dropdownHTML('c-parent',parentOptions(t.name),t.parent||'')}
+    <label>Is a (optional — inherits valid-target rules and fields from this type)</label>
+    ${dropdownHTML('c-parent',parentOptions(t.name),parent)}
+    <label>Fields (shown as typed inputs when creating/editing this type)</label>
+    <div id="field-rows">${renderFieldRows(fields)}</div>
+    ${fieldAddFormHTML(newKind)}
     <div class="row">
       <button class="btn" id="a-save">Save</button>
       ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
     </div>
-    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`);
+    <div class="row"><button class="btn ghost small" id="a-back">Back to types</button></div>`;
 
-  let parent=t.parent||'';
-  wireDropdown('c-parent',v=>parent=v);
-  body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
-  body.querySelector('#a-save').onclick=async()=>{
-    try{
-      const u=await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
-        glyph:body.querySelector('#t-glyph').value.trim()||t.glyph,
-        color:body.querySelector('#t-color').value,
-        icon:body.querySelector('#t-icon').value.trim(),
-        parent:parent||null,
-      })});
-      etypes.set(u.name,u);
-      render();
-      after?after():closeSheet();
-    }catch(e){ toast('Save failed: '+e.message); }
-  };
-  const delBtn=body.querySelector('#a-del');
-  if(delBtn) delBtn.onclick=async()=>{
-    try{
-      await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'DELETE'});
-      etypes.delete(t.name);
-      after?after():closeSheet();
-    }catch(e){ toast('Delete failed: '+e.message); }
-  };
+  function wire(){
+    openSheet(html());
+    wireDropdown('c-parent',v=>parent=v);
+    wireDropdown('c-nfkind',v=>{ newKind=v; wire(); });
+    body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
+    body.querySelector('#a-addfield').onclick=()=>{
+      const key=body.querySelector('#nf-key').value.trim();
+      if(!key){ toast('Key required'); return; }
+      const label=body.querySelector('#nf-label').value.trim()||key;
+      const field={key,label,kind:newKind};
+      if(newKind==='select'){
+        const opts=body.querySelector('#nf-opts').value.split('\n').map(s=>s.trim()).filter(Boolean);
+        if(!opts.length){ toast('At least one option required'); return; }
+        field.options=opts;
+      }
+      fields=fields.filter(f=>f.key!==key); // redefining a key replaces it
+      fields.push(field);
+      newKind='text';
+      wire();
+    };
+    body.querySelectorAll('[data-rmfield]').forEach(b=>
+      b.onclick=()=>{ fields.splice(Number(b.dataset.rmfield),1); wire(); });
+    body.querySelector('#a-save').onclick=async()=>{
+      try{
+        const u=await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
+          glyph:body.querySelector('#t-glyph').value.trim()||t.glyph,
+          color:body.querySelector('#t-color').value,
+          icon:body.querySelector('#t-icon').value.trim(),
+          parent:parent||null,
+          fieldSchema:fields,
+        })});
+        etypes.set(u.name,u);
+        render();
+        after?after():closeSheet();
+      }catch(e){ toast('Save failed: '+e.message); }
+    };
+    const delBtn=body.querySelector('#a-del');
+    if(delBtn) delBtn.onclick=async()=>{
+      try{
+        await req(`/types/entity/${encodeURIComponent(t.name)}`,{method:'DELETE'});
+        etypes.delete(t.name);
+        after?after():closeSheet();
+      }catch(e){ toast('Delete failed: '+e.message); }
+    };
+  }
+  wire();
 }
 
 function openNewRel(after){
@@ -1238,7 +1546,9 @@ function renderPairRules(pairs){
 
 function openEditRel(t,after){
   let pairs=(t.validPairs||[]).map(p=>({from:p.from,to:[...p.to]}));
+  let fields=(t.fieldSchema||[]).map(f=>({...f,options:f.options?[...f.options]:undefined}));
   let directed=t.directed;
+  let newKind='text';
   const etypeOpts=[...etypes.values()].map(e=>e.name);
 
   const html=()=>`
@@ -1267,6 +1577,9 @@ function openEditRel(t,after){
       </div>
     </div>
     <div class="row"><button class="btn ghost small" id="a-addpair" type="button">+ Add rule</button></div>
+    <label>Fields (shown as typed inputs when creating/editing this relationship)</label>
+    <div id="field-rows">${renderFieldRows(fields)}</div>
+    ${fieldAddFormHTML(newKind)}
     <div class="row">
       <button class="btn" id="a-save">Save</button>
       ${t.builtin?'':'<button class="btn danger" id="a-del">Delete</button>'}
@@ -1278,6 +1591,7 @@ function openEditRel(t,after){
     openSheet(html());
     wireChips('#c-dir',v=>directed=v==='1');
     wireDropdown('c-pfrom',v=>pfrom=v);
+    wireDropdown('c-nfkind',v=>{ newKind=v; wire(); });
     body.querySelector('#a-back').onclick=()=>after?after():closeSheet();
     body.querySelector('#a-addpair').onclick=()=>{
       const to=[...body.querySelector('#c-pto').selectedOptions].map(o=>o.value);
@@ -1287,10 +1601,27 @@ function openEditRel(t,after){
     };
     body.querySelectorAll('[data-rmpair]').forEach(b=>
       b.onclick=()=>{ pairs.splice(Number(b.dataset.rmpair),1); wire(); });
+    body.querySelector('#a-addfield').onclick=()=>{
+      const key=body.querySelector('#nf-key').value.trim();
+      if(!key){ toast('Key required'); return; }
+      const label=body.querySelector('#nf-label').value.trim()||key;
+      const field={key,label,kind:newKind};
+      if(newKind==='select'){
+        const opts=body.querySelector('#nf-opts').value.split('\n').map(s=>s.trim()).filter(Boolean);
+        if(!opts.length){ toast('At least one option required'); return; }
+        field.options=opts;
+      }
+      fields=fields.filter(f=>f.key!==key);
+      fields.push(field);
+      newKind='text';
+      wire();
+    };
+    body.querySelectorAll('[data-rmfield]').forEach(b=>
+      b.onclick=()=>{ fields.splice(Number(b.dataset.rmfield),1); wire(); });
     body.querySelector('#a-save').onclick=async()=>{
       try{
         const u=await req(`/types/rel/${encodeURIComponent(t.name)}`,{method:'PATCH',body:JSON.stringify({
-          directed, color:body.querySelector('#t-color').value, validPairs:pairs,
+          directed, color:body.querySelector('#t-color').value, validPairs:pairs, fieldSchema:fields,
         })});
         rtypes.set(u.name,u);
         render();
