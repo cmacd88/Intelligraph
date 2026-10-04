@@ -1,10 +1,14 @@
 import axios from 'axios';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 
 // HTTP client for IntelliGraph REST API
 // Defaults to localhost:4000 (docker-compose service name 'api')
 // Can be overridden with API_URL env var
 
 const API_URL = process.env.API_URL || 'http://localhost:4000';
+const PDF_TIMEOUT_MS = Number(process.env.PDF_TIMEOUT_MS) || 60000; // 60 seconds
+const PDF_MAX_BYTES = Number(process.env.PDF_MAX_BYTES) || 50 * 1024 * 1024; // 50 MB
+
 
 const client = axios.create({
   baseURL: API_URL,
@@ -131,7 +135,11 @@ export const graphApi = {
 
   async readPdf(url) {
     // Fetch PDF from URL
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    const response = await axios.get(url, {
+       responseType: 'arraybuffer',
+        timeout: PDF_TIMEOUT_MS,
+        maxContentLength: PDF_MAX_BYTES,
+      });
     const pdfBuffer = Buffer.from(response.data);
     
     // Parse PDF (requires pdf-parse library)

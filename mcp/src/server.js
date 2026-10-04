@@ -291,7 +291,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'pdf.read': {
         const result = await graphApi.readPdf(args.url);
-        return { content: [{ type: 'text', text: result.text }] };
+        return {
+          content: [{ type: 'text', text: `[pages: ${result.pages}]\n\n${result.text}` }] };
       }
 
       default:
