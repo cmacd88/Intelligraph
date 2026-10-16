@@ -22,14 +22,13 @@ export const graphApi = {
     return res.data;
   },
 
-  async neighbors(uid, depth = 1) {
-    const res = await client.get(`/graph/neighbors/${uid}`, { params: { depth } });
+  async neighbors(uid, limit = 60) {
+    const res = await client.get(`/graph/neighbors/${uid}`, { params: { limit } });
     return res.data;
   },
 
-  async path(from, to, via = null) {
-    const params = { from, to };
-    if (via) params.via = via;
+  async path(from, to, depth = 6) {
+    const params = { from, to, depth };
     const res = await client.get('/graph/path', { params });
     return res.data;
   },
@@ -44,8 +43,24 @@ export const graphApi = {
     return res.data;
   },
 
-  async all(limit = 500, offset = 0) {
-    const res = await client.get('/graph', { params: { limit, offset } });
+  async all(limit = 500, offset = 0, edgeLimit = undefined) {
+    const res = await client.get('/graph', { params: { limit, offset, edgeLimit } });
+    return res.data;
+  },
+
+  // Read-only Cypher. The API refuses anything that plans as a write.
+  async query(cypher, rowCap) {
+    const res = await client.post('/graph/query', { cypher, rowCap });
+    return res.data;
+  },
+
+  async listQueries() {
+    const res = await client.get('/queries');
+    return res.data;
+  },
+
+  async saveQuery(name, cypher, notes = '') {
+    const res = await client.post('/queries', { name, cypher, notes });
     return res.data;
   },
 

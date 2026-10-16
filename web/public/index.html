@@ -64,7 +64,7 @@ h2{margin:0;font-size:17px}
 .sub{color:var(--dim);font-size:13px;margin-top:2px}
 label{display:block;font-size:11px;font-weight:700;color:var(--dim);
   text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px}
-input[type=text],textarea,select{width:100%;background:var(--bg);border:1px solid var(--border);
+input[type=text],input[type=number],textarea,select{width:100%;background:var(--bg);border:1px solid var(--border);
   border-radius:10px;padding:10px 12px;color:var(--text);font:15px system-ui,sans-serif;outline:none}
 input:focus,textarea:focus,select:focus{border-color:var(--accent)}
 textarea{height:76px;resize:vertical}
@@ -160,14 +160,44 @@ let hidden=new Set();          // entity types toggled off
 let showLabels=true;
 let focusUid=null, focusDepth=0;   // N-degree-of-separation filter (0 = off)
 let collapsed=new Set();       // uids of nodes whose off-side subtree is folded
+let viewLabel=null;            // name of the query whose results are on screen
+let queries=[];                // saved Cypher queries
+
+// The whole graph is held in `nodes`/`edges`; what gets drawn is a bounded,
+// connectivity-aware slice of it (see budgetSelect).
+let pinned=new Set(), pinVer=0;     // uids always drawn: searched, expanded, path, new
+let scope=null, scopeEdges=null, scopeVer=0;  // query results on screen (null = no query)
+let cutMap=new Map();          // uid -> links to it that are NOT drawn
+
+// How much to draw. Persisted per browser.
+const LIMIT_KEY='ig.limits';
+let limits={nodes:500,edges:null};
+try{ Object.assign(limits,JSON.parse(localStorage.getItem(LIMIT_KEY)||'{}')); }catch{}
+function saveLimits(){ try{ localStorage.setItem(LIMIT_KEY,JSON.stringify(limits)); }catch{} }
 
 const $=id=>document.getElementById(id);
 const svg=$('canvas'), sheet=$('sheet'), body=$('body'),
       backdrop=$('backdrop'), hintEl=$('hint'), statusEl=$('status'),
       toastEl=$('toast'), resultsEl=$('results');
 
-const byUid=u=>nodes.find(n=>n.uid===u);
-const degree=u=>edges.filter(e=>e.from===u||e.to===u).length;
+// Indexes over the full graph, rebuilt only when the arrays change
+// (identity or length — every mutation site pushes or replaces).
+const idOf=(()=>{ const m=new WeakMap(); let i=0; return o=>{ if(!m.has(o)) m.set(o,++i); return m.get(o); }; })();
+let _idxKey='', _byUid=new Map(), _adj=new Map();
+function indexes(){
+  const key=idOf(nodes)+':'+nodes.length+':'+idOf(edges)+':'+edges.length;
+  if(key===_idxKey) return;
+  _byUid=new Map(nodes.map(n=>[n.uid,n]));
+  _adj=new Map(nodes.map(n=>[n.uid,[]]));
+  for(const e of edges){
+    _adj.get(e.from)?.push(e);
+    if(e.to!==e.from) _adj.get(e.to)?.push(e);
+  }
+  _idxKey=key;
+}
+const byUid=u=>{ indexes(); return _byUid.get(u); };
+const fullAdj=()=>{ indexes(); return _adj; };
+const degree=u=>(fullAdj().get(u)||[]).length;   // true degree, whatever is drawn
 
 // Finds an empty spot near (cx,cy) in graph space, so repeatedly creating
 // nodes without panning doesn't stack them on top of each other. Spirals
@@ -214,13 +244,16 @@ function toast(m){
 }
 
 function setStatus(){
-  const vis=visible().n.length;
+  const v=visible(), vis=v.n.length;
   const bits=[];
+  if(cutMap.size) bits.push(`${cutMap.size} with undrawn links`);
   if(hidden.size) bits.push(`${hidden.size} type${hidden.size>1?'s':''} hidden`);
   if(focusUid&&focusDepth>0) bits.push(`${focusDepth}° focus`);
   if(collapsed.size) bits.push(`${collapsed.size} collapsed`);
+  if(viewLabel) bits.unshift(`query: ${viewLabel}`);
   const extra=bits.length?` · ${bits.join(' · ')}`:'';
-  statusEl.textContent=`${vis}/${nodes.length} entities · ${edges.length} links${extra}`;
+  const nl=v.e.length;
+  statusEl.textContent=`${vis.toLocaleString()}/${nodes.length.toLocaleString()} entities · ${nl.toLocaleString()}/${edges.length.toLocaleString()} links${extra}`;
 }
 
 async function boot(){
@@ -239,10 +272,44 @@ async function boot(){
 
 async function loadGraph(){
   try{
-    const g=await req('/graph');
+    const g=await req('/graph/full');
     nodes=g.nodes; edges=g.edges;
+    viewLabel=null; scope=scopeEdges=null; scopeVer++;
+    pinned.clear(); pinVer++; collapsed.clear();
     fit(); render(); setStatus();
+    if(g.truncated&&(g.truncated.nodes||g.truncated.edges))
+      toast(`Graph exceeds the server load cap (${g.caps.nodes.toLocaleString()} nodes / ${g.caps.edges.toLocaleString()} links) — some data is not loaded`);
   }catch(e){ toast('Load failed: '+e.message); }
+}
+
+// Show query results. They are looked up in the loaded graph (anything
+// missing is merged in), then drawn as a scope: exactly the returned
+// nodes, with the returned links — or, for a query that returns only
+// nodes, the existing links among them. merge=true adds to the current scope.
+function showResults(res,label,merge){
+  mergeSub({nodes:res.nodes.map(n=>({...n})),edges:res.edges});
+  const uids=res.nodes.map(n=>n.uid);
+  const have=new Set(uids);
+  let eids=res.edges.map(e=>e.id);
+  if(!eids.length){
+    for(const u of uids) for(const ed of fullAdj().get(u)||[])
+      if(have.has(ed.from)&&have.has(ed.to)) eids.push(ed.id);
+  }
+  if(merge&&scope){
+    uids.forEach(u=>scope.add(u)); eids.forEach(i=>scopeEdges.add(i));
+    viewLabel=(viewLabel?viewLabel+' + ':'')+label;
+  }else{
+    scope=new Set(uids); scopeEdges=new Set(eids);
+    pinned.clear(); pinVer++; collapsed.clear(); viewLabel=label;
+  }
+  scopeVer++;
+  fit(); render(); setStatus();
+}
+
+function clearScope(){
+  scope=scopeEdges=null; scopeVer++; viewLabel=null;
+  pinned.clear(); pinVer++;
+  fit(); render(); setStatus();
 }
 
 async function loadSources(){
@@ -260,18 +327,13 @@ const el=(tag,attrs)=>{
 // BFS hop-distance from `uid` over the full (untyped-filtered) graph.
 // Returns Map<uid, hops>. uid itself is hop 0.
 function bfsDepths(uid){
-  const adj=new Map();
-  for(const e of edges){
-    if(!adj.has(e.from)) adj.set(e.from,[]);
-    if(!adj.has(e.to)) adj.set(e.to,[]);
-    adj.get(e.from).push(e.to);
-    adj.get(e.to).push(e.from);
-  }
+  const adj=fullAdj();
   const dist=new Map([[uid,0]]);
   const q=[uid];
-  while(q.length){
-    const cur=q.shift(), d=dist.get(cur);
-    for(const nb of adj.get(cur)||[]){
+  for(let h=0;h<q.length;h++){
+    const cur=q[h], d=dist.get(cur);
+    for(const ed of adj.get(cur)||[]){
+      const nb=ed.from===cur?ed.to:ed.from;
       if(!dist.has(nb)){ dist.set(nb,d+1); q.push(nb); }
     }
   }
@@ -308,8 +370,10 @@ function components(n,e,without){
 // reason about.
 function preCollapseGraph(){
   let n=nodes.filter(x=>!hidden.has(x.type));
+  if(scope) n=n.filter(x=>scope.has(x.uid)||pinned.has(x.uid));
   let ids=new Set(n.map(x=>x.uid));
   let e=edges.filter(x=>ids.has(x.from)&&ids.has(x.to));
+  if(scope) e=e.filter(x=>scopeEdges.has(x.id)||(pinned.has(x.from)&&pinned.has(x.to)));
 
   if(focusUid&&focusDepth>0){
     const dist=bfsDepths(focusUid);
@@ -317,7 +381,239 @@ function preCollapseGraph(){
     ids=new Set(n.map(x=>x.uid));
     e=e.filter(x=>ids.has(x.from)&&ids.has(x.to));
   }
+
+  // Query results are shown whole; anything else is held to the display
+  // limits.
+  if(!scope){
+    const must=new Set(pinned);
+    if(focusUid) must.add(focusUid);
+    const b=budgeted(n,e,must);
+    if(b){
+      n=n.filter(x=>b.uids.has(x.uid));
+      e=e.filter(x=>b.eids.has(x.id));
+    }
+  }
   return {n,e};
+}
+
+// ---- display budget -------------------------------------------------
+//
+// The whole graph is loaded, but only `limits.nodes` nodes / `limits.edges`
+// links are drawn. The slice is chosen so it never misleads:
+//   * it grows outward from the best-connected nodes (and anything pinned),
+//     so every drawn node is reached through a drawn link — it cannot look
+//     isolated unless it truly is;
+//   * the links that discovered each node are never dropped by the link
+//     limit (so the limit may be exceeded rather than orphan a node);
+//   * any drawn node that still has undrawn links gets a "+N" badge
+//     (see computeCut / render).
+// Pinned nodes are always drawn, in addition to the node limit.
+function budgetSelect(n,e,must){
+  const NL=limits.nodes||500, EL=limits.edges||0;
+  if(n.length<=NL&&(!EL||e.length<=EL)) return null;   // everything fits
+
+  const adj=new Map(n.map(x=>[x.uid,[]]));
+  for(const ed of e){
+    adj.get(ed.from).push(ed);
+    if(ed.to!==ed.from) adj.get(ed.to).push(ed);
+  }
+  const deg=u=>adj.get(u).length;
+  const other=(ed,u)=>ed.from===u?ed.to:ed.from;
+
+  const sel=new Set(), tree=new Set(), queue=[];
+  for(const u of must) if(adj.has(u)){ sel.add(u); queue.push(u); }
+  // Pinned nodes are extras on top of the limit, so revealing neighbours
+  // adds to the view instead of displacing what is already there.
+  const CAP=NL+sel.size;
+
+  const drain=()=>{
+    for(let h=0;h<queue.length&&sel.size<CAP;h++){
+      const u=queue[h];
+      const nbrs=adj.get(u).slice().sort((p,q)=>deg(other(q,u))-deg(other(p,u)));
+      for(const ed of nbrs){
+        const v=other(ed,u);
+        if(sel.has(v)) continue;
+        if(sel.size>=CAP) break;
+        sel.add(v); tree.add(ed.id); queue.push(v);
+      }
+    }
+  };
+  drain();
+
+  // New seeds: best-connected node not yet reached, so separate
+  // components each get a share while budget remains.
+  if(sel.size<CAP){
+    const order=n.map(x=>x.uid).sort((p,q)=>deg(q)-deg(p));
+    for(const u of order){
+      if(sel.size>=CAP) break;
+      if(sel.has(u)) continue;
+      sel.add(u); queue.length=0; queue.push(u); drain();
+    }
+  }
+
+  let out=e.filter(ed=>sel.has(ed.from)&&sel.has(ed.to));
+  if(EL&&out.length>EL){
+    const keep=new Set(tree), has=new Set();
+    for(const ed of out) if(tree.has(ed.id)){ has.add(ed.from); has.add(ed.to); }
+    for(const ed of out){            // pinned nodes the tree didn't reach
+      if(keep.has(ed.id)) continue;
+      if(!has.has(ed.from)||!has.has(ed.to)){
+        keep.add(ed.id); has.add(ed.from); has.add(ed.to);
+      }
+    }
+    for(const ed of out){ if(keep.size>=EL) break; keep.add(ed.id); }
+    out=out.filter(ed=>keep.has(ed.id));
+  }
+  return {uids:sel, eids:new Set(out.map(ed=>ed.id))};
+}
+
+let _bsKey='', _bsVal=null;
+function budgeted(n,e,must){
+  const key=[idOf(nodes),nodes.length,idOf(edges),edges.length,
+    [...hidden].sort().join(','),focusUid,focusDepth,
+    limits.nodes,limits.edges,pinVer,scopeVer].join('|');
+  if(key!==_bsKey){ _bsVal=budgetSelect(n,e,must); _bsKey=key; }
+  return _bsVal;
+}
+
+// Nodes straight from the database may have no saved position (x=y=0).
+// Place them beside an already-placed neighbour rather than piling them on
+// the origin. Client-side only; nothing is saved unless the user drags.
+const placedSet=new WeakSet();
+function ensurePlaced(vn,ve){
+  const todo=vn.filter(x=>!x.x&&!x.y&&!placedSet.has(x));
+  if(!todo.length) return;
+  const pending=new Set(todo.map(x=>x.uid));
+  const idx=new Map(vn.map(x=>[x.uid,x]));
+  const adj=new Map(vn.map(x=>[x.uid,[]]));
+  for(const ed of ve){
+    if(adj.has(ed.from)&&adj.has(ed.to)){
+      adj.get(ed.from).push(ed.to); adj.get(ed.to).push(ed.from);
+    }
+  }
+  const GAP=R*2.4, grid=new Map();
+  const cellOf=v=>Math.floor(v/GAP);
+  const put=n=>{
+    const k=cellOf(n.x)+','+cellOf(n.y);
+    if(!grid.has(k)) grid.set(k,[]);
+    grid.get(k).push(n);
+  };
+  const clear=(x,y)=>{
+    const cx=cellOf(x), cy=cellOf(y);
+    for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+      const l=grid.get((cx+i)+','+(cy+j));
+      if(l) for(const m of l) if(Math.hypot(m.x-x,m.y-y)<GAP) return false;
+    }
+    return true;
+  };
+  const spot=(cx,cy)=>{
+    if(clear(cx,cy)) return {x:cx,y:cy};
+    for(let ring=1;ring<=80;ring++){
+      const dist=GAP*ring*.8, pts=6+ring*2;
+      for(let i=0;i<pts;i++){
+        const a=2*Math.PI*i/pts+ring*.5;
+        const x=cx+Math.cos(a)*dist, y=cy+Math.sin(a)*dist;
+        if(clear(x,y)) return {x,y};
+      }
+    }
+    return {x:cx,y:cy};
+  };
+  for(const x of vn) if(!pending.has(x.uid)) put(x);
+
+  const kids=new Map();
+  const place=(node,x,y)=>{
+    const p=spot(x,y);
+    node.x=Math.round(p.x); node.y=Math.round(p.y);
+    placedSet.add(node); pending.delete(node.uid); put(node);
+  };
+  const spread=u=>{            // place u's pending neighbours around it
+    const q=[u];
+    for(let h=0;h<q.length;h++){
+      const cur=idx.get(q[h]);
+      for(const nb of adj.get(cur.uid)){
+        if(!pending.has(nb)) continue;
+        const c=kids.get(cur.uid)||0; kids.set(cur.uid,c+1);
+        const a=c*2.399963;
+        place(idx.get(nb),cur.x+Math.cos(a)*150,cur.y+Math.sin(a)*150);
+        q.push(nb);
+      }
+    }
+  };
+  // grow from nodes that already have a position
+  for(const x of vn) if(!pending.has(x.uid)) spread(x.uid);
+  // components with nothing placed in them: lay them out to the right
+  let maxX=-Infinity, minY=Infinity;
+  for(const x of vn) if(!pending.has(x.uid)){ maxX=Math.max(maxX,x.x); minY=Math.min(minY,x.y); }
+  let ox=isFinite(maxX)?maxX+300:0, oy=isFinite(minY)?minY:0;
+  for(const x of todo){
+    if(!pending.has(x.uid)) continue;
+    place(x,ox,oy); spread(x.uid);
+    oy+=GAP*2;
+    if(oy>2400){ oy=isFinite(minY)?minY:0; ox+=300; }
+  }
+}
+
+// Links to each drawn node that are not drawn: its true degree, less what
+// is on screen, less links folded away by collapse (those have their own
+// badge).
+function computeCut(n3,e3,e0,hiddenUids){
+  const adj=fullAdj(), drawn=new Map(), folded=new Map();
+  const bump=(m,k)=>m.set(k,(m.get(k)||0)+1);
+  for(const ed of e3){ bump(drawn,ed.from); if(ed.to!==ed.from) bump(drawn,ed.to); }
+  if(hiddenUids.size) for(const ed of e0){
+    const fh=hiddenUids.has(ed.from), th=hiddenUids.has(ed.to);
+    if(fh&&!th) bump(folded,ed.to); else if(th&&!fh) bump(folded,ed.from);
+  }
+  const out=new Map();
+  for(const x of n3){
+    const c=(adj.get(x.uid)||[]).length-(drawn.get(x.uid)||0)-(folded.get(x.uid)||0);
+    if(c>0) out.set(x.uid,c);
+  }
+  return out;
+}
+
+// Reveal a node's undrawn neighbours (strongest first, capped so a hub
+// can't bury the canvas). Returns what happened so callers can report it.
+const EXPAND_CAP=300;
+function expandLocal(uid){
+  const shown=new Set(visible().n.map(x=>x.uid));
+  const cand=new Map();
+  let blocked=0;
+  for(const ed of fullAdj().get(uid)||[]){
+    const v=ed.from===uid?ed.to:ed.from;
+    if(v===uid||shown.has(v)||cand.has(v)) continue;
+    const node=byUid(v);
+    if(!node) continue;
+    if(hidden.has(node.type)){ blocked++; continue; }
+    cand.set(v,node);
+  }
+  const list=[...cand.values()].sort((a,b)=>degree(b.uid)-degree(a.uid));
+  const take=list.slice(0,EXPAND_CAP);
+  pinned.add(uid); take.forEach(x=>pinned.add(x.uid)); pinVer++;
+  return {added:take.length,total:list.length,blocked,nodes:take};
+}
+
+function expandCut(uid){
+  const r=expandLocal(uid);
+  if(!r.added){
+    toast(r.blocked
+      ?`${r.blocked} linked entit${r.blocked===1?'y is':'ies are'} hidden by the type filter`
+      :'Nothing more to show');
+  }else if(r.total>r.added){
+    toast(`Showing ${r.added} of ${r.total} more neighbours`);
+  }
+  render(); setStatus();
+  panToIfOffscreen(r.nodes);
+}
+
+function panToIfOffscreen(list){
+  if(!list.length) return;
+  const w=svg.clientWidth, h=svg.clientHeight;
+  const off=list.some(n=>{
+    const sx=n.x*cam.k+cam.x, sy=n.y*cam.k+cam.y;
+    return sx<0||sy<0||sx>w||sy>h;
+  });
+  if(off){ fit(); render(); }
 }
 
 // A node can only be collapsed if it's a true pendant point: removing it
@@ -340,7 +636,7 @@ function pendantInfo(uid){
 // BloodHound-style fold: hides the dangling side of each collapsed pendant
 // point and replaces it with a single "+N" badge attached to that node.
 function collapseView(n,e){
-  if(!collapsed.size) return {n,e,badges:[]};
+  if(!collapsed.size) return {n,e,badges:[],hiddenUids:new Set()};
 
   const hiddenUids=new Set();
   const badges=[];
@@ -367,13 +663,27 @@ function collapseView(n,e){
   const n2=n.filter(x=>!hiddenUids.has(x.uid));
   const ids=new Set(n2.map(x=>x.uid));
   const e2=e.filter(x=>ids.has(x.from)&&ids.has(x.to));
-  return {n:n2,e:e2,badges};
+  return {n:n2,e:e2,badges,hiddenUids};
 }
 
+// The drawn slice is recomputed only when something that affects it
+// changes (cheap key below). Nodes and links are shared objects, so
+// dragging — which mutates x/y in place — needs no recompute. Code that
+// edits a node/link in place must call viewDirty().
+let _visKey='', _vis=null;
+function viewDirty(){ _visKey=''; _bsKey=''; _idxKey=''; }
 function visible(){
+  const key=[idOf(nodes),nodes.length,idOf(edges),edges.length,
+    [...hidden].sort().join(','),focusUid,focusDepth,limits.nodes,limits.edges,
+    pinVer,scopeVer,[...collapsed.keys()].join(',')].join('|');
+  if(key===_visKey) return _vis;
   const {n,e}=preCollapseGraph();
-  const {n:n3,e:e3,badges}=collapseView(n,e);
-  return {n:n3, e:e3, badges};
+  const {n:n3,e:e3,badges,hiddenUids}=collapseView(n,e);
+  ensurePlaced(n3,e3);
+  cutMap=computeCut(n3,e3,e,hiddenUids);
+  _vis={n:n3, e:e3, badges};
+  _visKey=key;
+  return _vis;
 }
 
 function render(){
@@ -523,6 +833,30 @@ function render(){
       render(); setStatus();
     });
     g.appendChild(bg);
+  }
+
+  // undrawn-link badges: a drawn node whose links aren't all on screen
+  // must never look unconnected
+  for(const n of vn){
+    const c=cutMap.get(n.uid);
+    if(!c) continue;
+    const label='+'+(c>=1000?(c/1000).toFixed(1).replace(/\.0$/,'')+'k':c);
+    const w=Math.max(20,label.length*7+10);
+    const bx=n.x+R-2, by=n.y+R-2;
+    const cg=el('g',{style:'cursor:pointer'});
+    cg.appendChild(el('rect',{x:bx-w/2,y:by-9,width:w,height:18,rx:9,
+      fill:'var(--surface2)',stroke:'var(--select)','stroke-width':1.5,
+      'stroke-dasharray':'3,2'}));
+    const ct=el('text',{x:bx,y:by+4,'text-anchor':'middle','font-size':11,
+      'font-weight':700,fill:'var(--select)',
+      style:'pointer-events:none;user-select:none'});
+    ct.textContent=label;
+    cg.appendChild(ct);
+    const tip=el('title',{});
+    tip.textContent=`${c} more link${c===1?'':'s'} not drawn — tap to show`;
+    cg.appendChild(tip);
+    cg.addEventListener('pointerdown',ev=>{ ev.stopPropagation(); expandCut(n.uid); });
+    g.appendChild(cg);
   }
 
   svg.appendChild(g);
@@ -701,7 +1035,7 @@ const hideResults=()=>resultsEl.style.display='none';
 async function focusNode(uid){
   let n=byUid(uid);
   if(!n){
-    // hit is outside the loaded set — pull it and its neighbourhood in
+    // not in the loaded set (created elsewhere since load) — pull it in
     try{
       const sub=await req(`/graph/neighbors/${uid}`);
       const e=await req(`/entities/${uid}`);
@@ -710,6 +1044,9 @@ async function focusNode(uid){
     }catch(err){ toast('Could not load entity'); return; }
   }
   if(!n) return;
+  // bring it and its neighbours into view if the display limits left it out
+  if(!visible().n.some(x=>x.uid===uid)) expandLocal(uid);
+  n=byUid(uid);
   cam.k=1.1;
   cam.x=svg.clientWidth/2-n.x*cam.k;
   cam.y=svg.clientHeight/2-n.y*cam.k;
@@ -951,6 +1288,12 @@ function openInspect(n){
     </div>`);
 
   body.querySelector('#a-exp').onclick=async()=>{
+    const local=expandLocal(n.uid);
+    if(local.added){
+      closeSheet(); render(); setStatus(); panToIfOffscreen(local.nodes);
+      if(local.total>local.added) toast(`Showing ${local.added} of ${local.total} more neighbours`);
+      return;
+    }
     try{
       const sub=await req(`/graph/neighbors/${n.uid}`);
       const before=nodes.length;
@@ -1112,7 +1455,7 @@ function openCreate(){
           source_uid:srcSel||null,
           x:Math.round(c.x),y:Math.round(c.y),
         })});
-        nodes.push(n); closeSheet(); render(); setStatus();
+        nodes.push(n); pinned.add(n.uid); pinVer++; closeSheet(); render(); setStatus();
       }catch(e){ toast('Create failed: '+e.message); }
     };
   }
@@ -1161,7 +1504,7 @@ function openEdit(n){
           name,props,
           notes:body.querySelector('#f-notes').value,
         })});
-        Object.assign(n,u,{type});
+        Object.assign(n,u,{type}); viewDirty();
         closeSheet(); render(); setStatus();
       }catch(e){ toast('Save failed: '+e.message); }
     };
@@ -1308,6 +1651,7 @@ function openEdge(e){
           body:JSON.stringify({confidence:conf,props})});
         const i=edges.findIndex(x=>x.id===u.id);
         if(i>=0) edges[i]=u;
+        viewDirty();
         sel=null; closeSheet(); render(); setStatus();
       }catch(err){ toast('Save failed: '+err.message); }
     };
@@ -1680,8 +2024,10 @@ async function findPath(from,to){
     const p=await req(`/graph/path?from=${from}&to=${to}`);
     if(!p.nodes.length){ toast('No path found within 6 hops'); render(); return; }
     mergeSub(p);
+    p.nodes.forEach(x=>pinned.add(x.uid)); pinVer++;
     // frame the path
     const ids=new Set(p.nodes.map(n=>n.uid));
+    visible();                       // places any unpositioned path nodes
     const pn=nodes.filter(n=>ids.has(n.uid));
     const xs=pn.map(n=>n.x), ys=pn.map(n=>n.y);
     const minX=Math.min(...xs)-100,maxX=Math.max(...xs)+100;
@@ -1722,9 +2068,17 @@ async function openMenu(){
     <div class="chips">
       <button class="chip ${showLabels?'on':''}" id="a-labels"
         style="border-color:var(--faint)${showLabels?';background:var(--faint);color:#e2e8f0':''}">Labels</button>
+      ${scope?`<button class="chip on" id="a-clearscope" style="border-color:var(--select);background:var(--select);color:#0f172a">Query: ${esc(viewLabel||'')} — show full graph</button>`:''}
       ${focusUid?`<button class="chip on" id="a-clearfocus" style="border-color:var(--select);background:var(--select);color:#0f172a">Focus: ${focusDepth}° — clear</button>`:''}
       ${collapsed.size?`<button class="chip on" id="a-clearfold" style="border-color:var(--select);background:var(--select);color:#0f172a">${collapsed.size} collapsed — expand all</button>`:''}
     </div>
+
+    <label>Display limits</label>
+    <div class="row" style="margin-top:6px">
+      <input type="number" id="l-nodes" min="1" max="20000" placeholder="Max nodes (500)" value="${limits.nodes||''}">
+      <input type="number" id="l-edges" min="1" max="100000" placeholder="Max links (no cap)" value="${limits.edges||''}">
+    </div>
+    <div class="mini">The whole graph is loaded; this only limits what is drawn, starting from the best-connected nodes. A node with links that aren't drawn shows a +N badge — tap it to reveal them.</div>
 
     <label>Most connected</label>
     ${hubs||'<div class="mini">Nothing yet</div>'}
@@ -1732,6 +2086,7 @@ async function openMenu(){
     <div class="row">
       <button class="btn ghost small" id="a-reload">Reload graph</button>
       <button class="btn ghost small" id="a-sources">Sources</button>
+      <button class="btn ghost small" id="a-queries">Queries</button>
     </div>
     <div class="row">
       <button class="btn ghost small" id="a-types">Manage types</button>
@@ -1759,7 +2114,21 @@ async function openMenu(){
     collapsed.clear(); render(); setStatus(); openMenu();
   };
 
+  const readLimit=(id,max)=>{
+    const v=parseInt(body.querySelector(id).value,10);
+    return Number.isFinite(v)&&v>0?Math.min(v,max):null;
+  };
+  const applyLimits=()=>{
+    limits.nodes=readLimit('#l-nodes',20000)||500;
+    limits.edges=readLimit('#l-edges',100000);
+    saveLimits(); fit(); render(); setStatus();
+  };
+  body.querySelector('#l-nodes').onchange=applyLimits;
+  body.querySelector('#l-edges').onchange=applyLimits;
+  const clearScopeBtn=body.querySelector('#a-clearscope');
+  if(clearScopeBtn) clearScopeBtn.onclick=()=>{ clearScope(); openMenu(); };
   body.querySelector('#a-reload').onclick=async()=>{ closeSheet(); await loadGraph(); };
+  body.querySelector('#a-queries').onclick=openQueries;
   body.querySelector('#a-sources').onclick=openSources;
   body.querySelector('#a-types').onclick=openManageTypes;
 }
@@ -1799,6 +2168,109 @@ async function openSources(){
         kind:body.querySelector('#s-kind').value,
       })});
       await loadSources(); openSources();
+    }catch(e){ toast('Failed: '+e.message); }
+  };
+}
+
+// ---------------------------------------------------------------- queries
+
+const SAMPLE_CYPHER=`MATCH (a:Entity)-[r]->(b:Entity)
+WHERE NOT type(r) STARTS WITH '_'
+RETURN a, r, b
+LIMIT 100`;
+let draft={uid:null,name:'',cypher:SAMPLE_CYPHER};
+
+async function loadQueries(){
+  try{ queries=await req('/queries'); }catch{ queries=[]; }
+}
+
+async function runCypher(cypher,label,merge){
+  const out=body.querySelector('#q-out');
+  if(out) out.innerHTML='<div class="mini">Running…</div>';
+  try{
+    const res=await req('/graph/query',{method:'POST',body:JSON.stringify({cypher})});
+    if(res.nodes.length){
+      showResults(res,label,merge);
+      closeSheet();
+      const cut=res.truncated?' (row cap hit)':'';
+      toast(`${res.nodes.length} entities, ${res.edges.length} links${cut}`);
+    }else if(out){
+      out.innerHTML=resultTable(res);
+    }
+  }catch(e){
+    if(out) out.innerHTML=`<div class="mini" style="color:var(--danger,#f87171)">${esc(e.message)}</div>`;
+    else toast(e.message);
+  }
+}
+
+function resultTable(res){
+  if(!res.rows.length) return '<div class="mini">No rows.</div>';
+  const cols=res.columns.filter(c=>res.rows.some(r=>r[c]!==undefined));
+  const head=cols.map(c=>`<th style="text-align:left;padding:3px 8px;border-bottom:1px solid var(--border)">${esc(c)}</th>`).join('');
+  const rows=res.rows.map(r=>`<tr>${cols.map(c=>
+    `<td style="padding:3px 8px;border-bottom:1px solid var(--border)">${esc(typeof r[c]==='object'?JSON.stringify(r[c]):r[c])}</td>`).join('')}</tr>`).join('');
+  return `<div style="overflow:auto;max-height:260px;font-size:12px"><table style="border-collapse:collapse;width:100%"><tr>${head}</tr>${rows}</table></div>
+    ${res.truncated?'<div class="mini">Row cap reached — results truncated.</div>':''}`;
+}
+
+async function openQueries(){
+  await loadQueries();
+  const list=queries.map(q=>
+    `<div class="prop" data-q="${q.uid}" style="cursor:pointer"><b>${esc(q.name)}</b>
+      <br><span class="rtype">${esc(q.cypher.split('\n')[0].slice(0,70))}</span></div>`).join('');
+  openSheet(`
+    <h2>Queries</h2>
+    <div class="sub">Read-only Cypher. Results with entities are drawn on the canvas.</div>
+    ${list||'<div class="mini">No saved queries yet</div>'}
+
+    <label>${draft.uid?'Edit query':'New query'}</label>
+    <input type="text" id="q-name" placeholder="Name, e.g. Everyone at Acme" value="${esc(draft.name)}">
+    <textarea id="q-cypher" style="height:130px;font-family:ui-monospace,monospace;font-size:12px" spellcheck="false">${esc(draft.cypher)}</textarea>
+    <div class="row">
+      <button class="btn" id="q-run">Run (replace)</button>
+      <button class="btn ghost" id="q-add">Add to view</button>
+    </div>
+    <div class="row">
+      <button class="btn ghost small" id="q-save">${draft.uid?'Save changes':'Save as new'}</button>
+      ${draft.uid?'<button class="btn ghost small" id="q-copy">Save copy</button><button class="btn ghost small" id="q-del">Delete</button>':''}
+      <button class="btn ghost small" id="a-back">Back</button>
+    </div>
+    <div id="q-out"></div>`);
+
+  const grab=()=>({name:body.querySelector('#q-name').value.trim(),
+    cypher:body.querySelector('#q-cypher').value.trim()});
+  body.querySelector('#a-back').onclick=openMenu;
+  body.querySelectorAll('.prop[data-q]').forEach(d=>d.onclick=()=>{
+    const q=queries.find(x=>x.uid===d.dataset.q);
+    draft={uid:q.uid,name:q.name,cypher:q.cypher}; openQueries();
+  });
+  body.querySelector('#q-run').onclick=()=>{
+    const f=grab(); if(!f.cypher){ toast('Query is empty'); return; }
+    draft={...draft,...f}; runCypher(f.cypher,f.name||'ad-hoc',false);
+  };
+  body.querySelector('#q-add').onclick=()=>{
+    const f=grab(); if(!f.cypher){ toast('Query is empty'); return; }
+    draft={...draft,...f}; runCypher(f.cypher,f.name||'ad-hoc',true);
+  };
+  const persist=async(asNew)=>{
+    const f=grab();
+    if(!f.name||!f.cypher){ toast('Name and query required'); return; }
+    try{
+      const saved=(draft.uid&&!asNew)
+        ?await req(`/queries/${draft.uid}`,{method:'PATCH',body:JSON.stringify(f)})
+        :await req('/queries',{method:'POST',body:JSON.stringify(f)});
+      draft={uid:saved.uid,name:saved.name,cypher:saved.cypher};
+      openQueries();
+    }catch(e){ toast('Failed: '+e.message); }
+  };
+  body.querySelector('#q-save').onclick=()=>persist(false);
+  const cp=body.querySelector('#q-copy'); if(cp) cp.onclick=()=>persist(true);
+  const del=body.querySelector('#q-del');
+  if(del) del.onclick=async()=>{
+    if(!confirm(`Delete "${draft.name}"?`)) return;
+    try{
+      await req(`/queries/${draft.uid}`,{method:'DELETE'});
+      draft={uid:null,name:'',cypher:SAMPLE_CYPHER}; openQueries();
     }catch(e){ toast('Failed: '+e.message); }
   };
 }

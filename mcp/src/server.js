@@ -127,12 +127,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'graph.neighbors',
-        description: 'N-hop expansion from an entity (discover related entities)',
+        description: 'One-hop expansion from an entity (direct neighbours and links)',
         inputSchema: {
           type: 'object',
           properties: {
             uid: { type: 'string', description: 'Entity UID' },
-            depth: { type: 'number', description: 'Hops (default 1)', default: 1 },
+            limit: { type: 'number', description: 'Max links (default 60, max 500)', default: 60 },
           },
           required: ['uid'],
         },
@@ -145,7 +145,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             from: { type: 'string', description: 'Starting entity UID' },
             to: { type: 'string', description: 'Ending entity UID' },
-            via: { type: 'array', items: { type: 'string' }, description: 'Optional relationship types to filter by' },
+            depth: { type: 'number', description: 'Max path length (default 6, max 10)', default: 6 },
           },
           required: ['from', 'to'],
         },
@@ -157,8 +157,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             limit: { type: 'number', description: 'Nodes to return (default 500, max 5000)', default: 500 },
-            offset: { type: 'number', description: 'Offset for pagination', default: 0 },
+            offset: { type: 'number', description: 'Nodes to skip, for pagination', default: 0 },
+            edgeLimit: { type: 'number', description: 'Max links (default 2x limit, max 20000)' },
           },
+        },
+      },
+      {
+        name: 'graph.query',
+        description: 'Run a read-only Cypher query. Writes are refused. Returns nodes/edges found in the results plus a flat table of scalar columns.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            cypher: { type: 'string', description: 'Cypher query (read-only)' },
+            rowCap: { type: 'number', description: 'Max rows (default and max 2000)' },
+          },
+          required: ['cypher'],
+        },
+      },
+      {
+        name: 'query.list',
+        description: 'List saved Cypher queries',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'query.save',
+        description: 'Save a named Cypher query for reuse in the UI',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            cypher: { type: 'string' },
+            notes: { type: 'string' },
+          },
+          required: ['name', 'cypher'],
         },
       },
       {
@@ -235,7 +266,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'graph.neighbors': {
-        const result = await graphApi.neighbors(args.uid, args.depth);
+        const result = await graphApi.neighbors(args.uid, args.limit);
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
@@ -250,12 +281,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'graph.path': {
-        const result = await graphApi.path(args.from, args.to, args.via);
+        const result = await graphApi.path(args.from, args.to, args.depth);
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'graph.all': {
-        const result = await graphApi.all(args.limit, args.offset);
+        const result = await graphApi.all(args.limit, args.offset, args.edgeLimit);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'graph.query': {
+        const result = await graphApi.query(args.cypher, args.rowCap);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'query.list': {
+        const result = await graphApi.listQueries();
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'query.save': {
+        const result = await graphApi.saveQuery(args.name, args.cypher, args.notes);
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 

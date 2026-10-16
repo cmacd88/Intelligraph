@@ -14,6 +14,10 @@ FOR (t:_RelType) REQUIRE t.name IS UNIQUE;
 CREATE CONSTRAINT source_uid IF NOT EXISTS
 FOR (s:_Source) REQUIRE s.uid IS UNIQUE;
 
+// Saved Cypher queries (reserved label, never shown as graph data).
+CREATE CONSTRAINT query_uid IF NOT EXISTS
+FOR (q:_Query) REQUIRE q.uid IS UNIQUE;
+
 // ============================================================
 // Indexes
 // ============================================================

@@ -21,6 +21,7 @@ app.use('/entities', require('./routes/entities'));
 app.use('/edges', require('./routes/edges'));
 app.use('/sources', require('./routes/sources'));
 app.use('/graph', require('./routes/graph'));
+app.use('/queries', require('./routes/queries'));
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
