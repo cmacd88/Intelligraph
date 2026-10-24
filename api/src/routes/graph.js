@@ -338,6 +338,18 @@ router.get('/neighbors/:uid', async (req, res, next) => {
 
 // ---------------------------------------------------------------- path
 
+const PATH_CAP = 500;          // most shortest paths returned
+const PATH_TIMEOUT_MS = 15000;
+
+/**
+ * Every shortest path between two entities (all of the minimum length, not
+ * just one), merged into a single node/edge set for display.
+ *
+ * Returns { nodes, edges, length, paths, truncated }: `length` is the hop
+ * count, `paths` how many distinct shortest paths there are, `truncated`
+ * true if PATH_CAP was hit (the set is then a subset of them).
+ * Empty nodes/edges means no path within `depth` hops.
+ */
 router.get('/path', async (req, res, next) => {
   try {
     const { from, to } = req.query;
@@ -349,29 +361,55 @@ router.get('/path', async (req, res, next) => {
     // from clamp(), never user text.
     const depth = clamp(req.query.depth, 6, 10);
 
-    const r = await read(
-      `MATCH (a:Entity {uid: $from}), (b:Entity {uid: $to})
-       MATCH p = shortestPath((a)-[*..${depth}]-(b))
-       WHERE none(rel IN relationships(p) WHERE type(rel) STARTS WITH '_')
-       RETURN p`,
-      { from, to },
-    );
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
+    let r;
+    try {
+      r = await session.run(
+        `MATCH (a:Entity {uid: $from}), (b:Entity {uid: $to})
+         MATCH p = allShortestPaths((a)-[*..${depth}]-(b))
+         WHERE none(rel IN relationships(p) WHERE type(rel) STARTS WITH '_')
+         RETURN p LIMIT toInteger($cap)`,
+        { from, to, cap: PATH_CAP + 1 },
+        { timeout: PATH_TIMEOUT_MS },
+      );
+    } finally {
+      await session.close();
+    }
 
-    if (!r.records.length) return res.json({ nodes: [], edges: [] });
+    const empty = { nodes: [], edges: [], length: 0, paths: 0, truncated: false };
+    if (!r.records.length) return res.json(empty);
 
-    const path = r.records[0].get('p');
-    const nodes = path.segments.length
-      ? [path.start, ...path.segments.map((s) => s.end)]
-      : [path.start];
+    const truncated = r.records.length > PATH_CAP;
+    const paths = r.records.slice(0, PATH_CAP).map((rec) => rec.get('p'));
+
+    const nodes = new Map();       // uid -> node json
+    const edges = new Map();       // elementId -> edge json
+    for (const path of paths) {
+      // Relationship direction is the stored one, not the walking one, so
+      // resolve its endpoints through the path's own nodes.
+      const uidOf = new Map();
+      const all = [path.start, ...path.segments.map((s) => s.end)];
+      for (const n of all) {
+        uidOf.set(n.elementId, n.properties.uid);
+        if (!nodes.has(n.properties.uid)) nodes.set(n.properties.uid, entityToJson(n));
+      }
+      for (const s of path.segments) {
+        const rel = s.relationship;
+        if (edges.has(rel.elementId)) continue;
+        edges.set(rel.elementId, edgeToJson(
+          rel,
+          uidOf.get(rel.startNodeElementId),
+          uidOf.get(rel.endNodeElementId),
+        ));
+      }
+    }
 
     res.json({
-      nodes: nodes.map(entityToJson),
-      edges: path.segments.map((s) =>
-        edgeToJson(
-          s.relationship,
-          s.start.properties.uid,
-          s.end.properties.uid,
-        )),
+      nodes: [...nodes.values()],
+      edges: [...edges.values()],
+      length: paths[0].segments.length,
+      paths: paths.length,
+      truncated,
     });
   } catch (e) { next(e); }
 });

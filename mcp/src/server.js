@@ -139,7 +139,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'graph.path',
-        description: 'Find shortest path between two entities',
+        description: 'Find ALL shortest paths between two entities (merged into one node/edge set; also returns length and path count)',
         inputSchema: {
           type: 'object',
           properties: {
