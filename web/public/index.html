@@ -168,6 +168,9 @@ let queries=[];                // saved Cypher queries
 let pinned=new Set(), pinVer=0;     // uids always drawn: searched, expanded, path, new
 let scope=null, scopeEdges=null, scopeVer=0;  // query results on screen (null = no query)
 let cutMap=new Map();          // uid -> links to it that are NOT drawn
+// What each Expand revealed (uid -> uids), so Compress can undo exactly that.
+const expansions=new Map();
+function resetPins(){ pinned.clear(); expansions.clear(); pinVer++; }
 
 // How much to draw. Persisted per browser.
 const LIMIT_KEY='ig.limits';
@@ -275,7 +278,7 @@ async function loadGraph(){
     const g=await req('/graph/full');
     nodes=g.nodes; edges=g.edges;
     viewLabel=null; scope=scopeEdges=null; scopeVer++;
-    pinned.clear(); pinVer++; collapsed.clear();
+    resetPins(); collapsed.clear();
     fit(); render(); setStatus();
     if(g.truncated&&(g.truncated.nodes||g.truncated.edges))
       toast(`Graph exceeds the server load cap (${g.caps.nodes.toLocaleString()} nodes / ${g.caps.edges.toLocaleString()} links) — some data is not loaded`);
@@ -300,7 +303,7 @@ function showResults(res,label,merge){
     viewLabel=(viewLabel?viewLabel+' + ':'')+label;
   }else{
     scope=new Set(uids); scopeEdges=new Set(eids);
-    pinned.clear(); pinVer++; collapsed.clear(); viewLabel=label;
+    resetPins(); collapsed.clear(); viewLabel=label;
   }
   scopeVer++;
   fit(); render(); setStatus();
@@ -308,7 +311,7 @@ function showResults(res,label,merge){
 
 function clearScope(){
   scope=scopeEdges=null; scopeVer++; viewLabel=null;
-  pinned.clear(); pinVer++;
+  resetPins();
   fit(); render(); setStatus();
 }
 
@@ -377,7 +380,7 @@ function preCollapseGraph(){
 
   if(focusUid&&focusDepth>0){
     const dist=bfsDepths(focusUid);
-    n=n.filter(x=>(dist.get(x.uid)??Infinity)<=focusDepth);
+    n=n.filter(x=>(dist.get(x.uid)??Infinity)<=focusDepth||pinned.has(x.uid));
     ids=new Set(n.map(x=>x.uid));
     e=e.filter(x=>ids.has(x.from)&&ids.has(x.to));
   }
@@ -573,15 +576,19 @@ function computeCut(n3,e3,e0,hiddenUids){
 }
 
 // Reveal a node's undrawn neighbours (strongest first, capped so a hub
-// can't bury the canvas). Returns what happened so callers can report it.
+// can't bury the canvas). Revealed nodes are pinned — they stay drawn
+// whatever the display limit or degrees-of-separation filter says — and
+// remembered per node so Compress can take back exactly this.
 const EXPAND_CAP=300;
 function expandLocal(uid){
   const shown=new Set(visible().n.map(x=>x.uid));
-  const cand=new Map();
+  const cand=new Map(), all=new Set();
   let blocked=0;
   for(const ed of fullAdj().get(uid)||[]){
     const v=ed.from===uid?ed.to:ed.from;
-    if(v===uid||shown.has(v)||cand.has(v)) continue;
+    if(v===uid||all.has(v)) continue;
+    all.add(v);
+    if(shown.has(v)) continue;
     const node=byUid(v);
     if(!node) continue;
     if(hidden.has(node.type)){ blocked++; continue; }
@@ -589,8 +596,36 @@ function expandLocal(uid){
   }
   const list=[...cand.values()].sort((a,b)=>degree(b.uid)-degree(a.uid));
   const take=list.slice(0,EXPAND_CAP);
-  pinned.add(uid); take.forEach(x=>pinned.add(x.uid)); pinVer++;
-  return {added:take.length,total:list.length,blocked,nodes:take};
+  const fresh=take.map(x=>x.uid);
+  if(!shown.has(uid)) fresh.unshift(uid);          // the node itself was out of view
+  if(fresh.length){
+    fresh.forEach(u=>pinned.add(u));
+    expansions.set(uid,[...(expansions.get(uid)||[]),...fresh]);
+    pinVer++;
+  }
+  return {added:take.length,total:list.length,blocked,nodes:take,neighbours:all.size};
+}
+
+// How many nodes this node's Expand is currently holding on screen.
+const expandedCount=uid=>(expansions.get(uid)||[]).filter(u=>pinned.has(u)).length;
+
+// Undo Expand: unpin what it revealed, and — since those nodes may have
+// been expanded themselves — what they revealed, and so on. Everything
+// else on screen stays put.
+function compressNode(uid){
+  const drop=new Set(), seen=new Set(), stack=[uid];
+  while(stack.length){
+    const u=stack.pop();
+    if(seen.has(u)) continue;
+    seen.add(u);
+    for(const v of expansions.get(u)||[]){ drop.add(v); stack.push(v); }
+    expansions.delete(u);
+  }
+  drop.forEach(u=>pinned.delete(u));
+  if(drop.size) pinVer++;
+  if(sel&&sel.kind==='node'&&drop.has(sel.id)) sel=null;
+  closeSheet(); render(); setStatus();
+  toast(drop.size?`Compressed — hid ${drop.size} entit${drop.size===1?'y':'ies'}`:'Nothing to compress');
 }
 
 function expandCut(uid){
@@ -598,7 +633,7 @@ function expandCut(uid){
   if(!r.added){
     toast(r.blocked
       ?`${r.blocked} linked entit${r.blocked===1?'y is':'ies are'} hidden by the type filter`
-      :'Nothing more to show');
+      :'All connections are already shown');
   }else if(r.total>r.added){
     toast(`Showing ${r.added} of ${r.total} more neighbours`);
   }
@@ -833,6 +868,25 @@ function render(){
       render(); setStatus();
     });
     g.appendChild(bg);
+  }
+
+  // compress markers: an expanded node shows a green "−"; tap to hide
+  // what its Expand revealed
+  for(const n of vn){
+    const k=expandedCount(n.uid);
+    if(!k) continue;
+    const bx=n.x-R+4, by=n.y-R+4;
+    const mg=el('g',{style:'cursor:pointer'});
+    mg.appendChild(el('circle',{cx:bx,cy:by,r:9,fill:'var(--link)',stroke:'var(--bg)','stroke-width':2}));
+    const mt=el('text',{x:bx,y:by+4,'text-anchor':'middle','font-size':13,'font-weight':700,
+      fill:'#0f172a',style:'pointer-events:none;user-select:none'});
+    mt.textContent='−';
+    mg.appendChild(mt);
+    const tip=el('title',{});
+    tip.textContent=`Compress — hide the ${k} entit${k===1?'y':'ies'} revealed from here`;
+    mg.appendChild(tip);
+    mg.addEventListener('pointerdown',ev=>{ ev.stopPropagation(); compressNode(n.uid); });
+    g.appendChild(mg);
   }
 
   // undrawn-link badges: a drawn node whose links aren't all on screen
@@ -1265,6 +1319,7 @@ function openInspect(n){
     ${props}${notes}
     <div class="row">
       <button class="btn small" id="a-exp">Expand</button>
+      ${expandedCount(n.uid)?`<button class="btn ghost small" id="a-comp">Compress (${expandedCount(n.uid)})</button>`:''}
       <button class="btn violet small" id="a-link">Link</button>
       <button class="btn ghost small" id="a-edit">Edit</button>
     </div>
@@ -1294,6 +1349,15 @@ function openInspect(n){
       if(local.total>local.added) toast(`Showing ${local.added} of ${local.total} more neighbours`);
       return;
     }
+    if(local.blocked){
+      toast(`${local.blocked} linked entit${local.blocked===1?'y is':'ies are'} hidden by the type filter`);
+      return;
+    }
+    // Nothing more to reveal locally. The server may still know of links
+    // created elsewhere since this page loaded, so ask once.
+    const none=()=>toast(degree(n.uid)
+      ?`All ${degree(n.uid)} connection${degree(n.uid)===1?' is':'s are'} already shown`
+      :'No connections');
     try{
       const sub=await req(`/graph/neighbors/${n.uid}`);
       const before=nodes.length;
@@ -1304,10 +1368,18 @@ function openInspect(n){
         x.x=n.x+Math.cos(a)*160; x.y=n.y+Math.sin(a)*160;
       });
       mergeSub({nodes:fresh,edges:sub.edges});
+      if(fresh.length){
+        fresh.forEach(x=>pinned.add(x.uid));
+        expansions.set(n.uid,[...(expansions.get(n.uid)||[]),...fresh.map(x=>x.uid)]);
+        pinVer++;
+      }
       closeSheet(); render(); setStatus();
-      if(nodes.length===before) toast('No new connections');
-    }catch(e){ toast('Expand failed: '+e.message); }
+      if(nodes.length===before) none();
+    }catch(e){ none(); }
   };
+
+  const compBtn=body.querySelector('#a-comp');
+  if(compBtn) compBtn.onclick=()=>compressNode(n.uid);
 
   body.querySelector('#a-link').onclick=()=>{
     linkFrom=n.uid;
